@@ -216,6 +216,22 @@ enum ShortcutEventSequence {
     // can ask for it, so carrying it only gives the target app an extra modifier.
     private static let preservedModifierMask = hardwareModifierMask.subtracting(.maskHelp)
 
+    static func managedFunctionFlags(
+        pressed: Bool, raw: CGEventFlags, state: ShortcutHardwareModifierState = hardwareModifierState
+    ) -> CGEventFlags? {
+        let observed = state.snapshot(raw)
+        var flags = observed.flags.intersection(preservedModifierMask)
+        if pressed {
+            guard flags.subtracting(.maskAlphaShift).isEmpty, !observed.functionFlagUnverified else { return nil }
+            flags.insert(.maskSecondaryFn)
+        } else if observed.functionState != "pressed" {
+            // The raw HID state can echo our own injected Fn. Only a distinct,
+            // unmarked physical Fn edge can establish continued keyboard ownership.
+            flags.remove(.maskSecondaryFn)
+        }
+        return flags
+    }
+
     static func diagnosticFlags(_ flags: CGEventFlags) -> UInt64 {
         flags.intersection(hardwareModifierMask.union(.maskNumericPad)).rawValue
     }

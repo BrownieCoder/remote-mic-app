@@ -124,6 +124,28 @@ struct RC003HeldFnSessionTests {
         #expect(f.events == ["a-down", "a-up"])
     }
 
+    @Test func aRapidPressAfterAStallWaitsForOutputRevocationAndKeepsItsFirstSamples() {
+        let f = Fixture()
+        var finishReset: (() -> Void)?
+        #expect(f.begin("old"))
+        f.audio(1, 9)
+        f.session.stop(deliveryGeneration: 1)
+        f.tick(2_100)
+        f.session.waitForOutputReset { finishReset = $0 }
+        #expect(f.begin("new"))
+        f.audio(2, 4)
+        f.session.stop(deliveryGeneration: 2)
+        #expect(!f.events.contains("new-down"))
+        f.pending[1] = 0
+        finishReset?()
+        #expect(f.events.suffix(2) == ["new-down", "audio-2-4"])
+        f.pending[2] = 0
+        f.tick(8)
+        #expect(f.events.last == "new-up")
+        finishReset?()
+        #expect(f.events.filter { $0 == "new-down" }.count == 1)
+    }
+
     @Test func stalledOrInterruptedPlaybackReleasesOnceAndLeavesOtherGenerationsAlone() {
         for interrupted in [false, true] {
             let f = Fixture()

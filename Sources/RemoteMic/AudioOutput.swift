@@ -813,6 +813,21 @@ final class VirtualAudioOutput {
 
     private var engine: AVAudioEngine?
     private var player: AVAudioPlayerNode?
+    // Only opted-in RC003 audio uses this node. Its queue can be revoked without
+    // stopping unrelated voice streams or an in-flight test tone on the original node.
+    private var heldFnPlayer: AVAudioPlayerNode?
+    private var heldFnPlayerEpoch: UInt64?
+    private var heldFnEpoch: UInt64 = 0
+    private var wantsHeldFnPlayer = false
+    private var pendingHeldFn: [Int: PendingDeliveryCounters] = [:]
+    private var drainSawInterruption = false
+
+    struct VoiceBufferTicket {
+        fileprivate let sampleCount: Int
+        fileprivate let deliveryGeneration: Int
+        fileprivate let playbackGeneration: UInt64
+        fileprivate let heldFnEpoch: UInt64?
+    }
     private var engineConfigurationObserver: NSObjectProtocol?
     private var engineConfigurationGeneration: UInt64 = 0
     private var rejectedWriteCount = 0
@@ -886,14 +901,26 @@ final class VirtualAudioOutput {
         engineQueue.setSpecific(key: engineQueueKey, value: ())
     }
 
-    /// Counts one buffer as queued for playback. Together with
-    /// `scheduledVoiceBufferDidFinish` this drives the pending-buffer count that
-    /// draining waits on, so it is the single seam a test can use to arm drain
-    /// bookkeeping without a live output device.
-    func registerPendingVoiceBuffer() {
+    @discardableResult
+    func registerPendingVoiceBuffer(
+        sampleCount: Int = 0, deliveryGeneration: Int = 0, rc003HeldFn: Bool = false
+    ) -> VoiceBufferTicket {
         playbackLock.lock()
+        defer { playbackLock.unlock() }
         pendingVoiceBufferCount += 1
-        playbackLock.unlock()
+        pendingVoiceSampleCount += sampleCount
+        playbackCounters.scheduledBuffers += 1
+        playbackCounters.scheduledSamples += sampleCount
+        playbackCountersByDeliveryGeneration[deliveryGeneration, default: .init()].scheduledBuffers += 1
+        playbackCountersByDeliveryGeneration[deliveryGeneration, default: .init()].scheduledSamples += sampleCount
+        pendingByDeliveryGeneration[deliveryGeneration, default: .init()].buffers += 1
+        pendingByDeliveryGeneration[deliveryGeneration, default: .init()].samples += sampleCount
+        if rc003HeldFn {
+            pendingHeldFn[deliveryGeneration, default: .init()].buffers += 1
+            pendingHeldFn[deliveryGeneration, default: .init()].samples += sampleCount
+        }
+        return .init(sampleCount: sampleCount, deliveryGeneration: deliveryGeneration,
+                     playbackGeneration: playbackGeneration, heldFnEpoch: rc003HeldFn ? heldFnEpoch : nil)
     }
 
     var pendingVoiceBufferCountForDiagnostics: Int {
@@ -1041,9 +1068,7 @@ final class VirtualAudioOutput {
 
         logStage("connect_mixer")
         let engine = AVAudioEngine()
-        let player = AVAudioPlayerNode()
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: sourceFormat)
+        let (player, reservedHeldFnPlayer) = Self.attachVoicePlayers(to: engine, format: sourceFormat)
 
         logStage("open_output_unit")
         guard let outputUnit = engine.outputNode.audioUnit else {
@@ -1094,6 +1119,8 @@ final class VirtualAudioOutput {
             }
             self.engine = engine
             self.player = player
+            self.heldFnPlayer = reservedHeldFnPlayer
+            prepareHeldFnPlayerIfRequested()
             updateOutputState { $0.selectedDevice = device }
             logStage("verify_output")
             refreshOutputStateOnEngineQueue()
@@ -1179,7 +1206,7 @@ final class VirtualAudioOutput {
     }
 
     @discardableResult
-    func enqueue(samples: [Int16], deliveryGeneration: Int = 0) -> Bool {
+    func enqueue(samples: [Int16], deliveryGeneration: Int = 0, rc003HeldFn: Bool = false) -> Bool {
         guard !samples.isEmpty else {
             logRejectedWrite(reason: "empty_samples")
             return false
@@ -1196,18 +1223,9 @@ final class VirtualAudioOutput {
             AppLogger.shared.write("AUDIO WRITE resumed rejected_count=\(rejectedWriteCount) state={\(basicDiagnosticState())}")
             rejectedWriteCount = 0
         }
-        playbackLock.lock()
-        let generation = playbackGeneration
-        let sampleCount = samples.count
-        pendingVoiceBufferCount += 1
-        pendingVoiceSampleCount += sampleCount
-        playbackCounters.scheduledBuffers += 1
-        playbackCounters.scheduledSamples += sampleCount
-        playbackCountersByDeliveryGeneration[deliveryGeneration, default: .init()].scheduledBuffers += 1
-        playbackCountersByDeliveryGeneration[deliveryGeneration, default: .init()].scheduledSamples += sampleCount
-        pendingByDeliveryGeneration[deliveryGeneration, default: .init()].buffers += 1
-        pendingByDeliveryGeneration[deliveryGeneration, default: .init()].samples += sampleCount
-        playbackLock.unlock()
+        let ticket = registerPendingVoiceBuffer(
+            sampleCount: samples.count, deliveryGeneration: deliveryGeneration, rc003HeldFn: rc003HeldFn
+        )
         let submittedAt = uptime()
         engineQueue.async { [weak self] in
             guard let self else { return }
@@ -1217,24 +1235,151 @@ final class VirtualAudioOutput {
                 self.atvvPlaybackTimings[deliveryGeneration, default: .init()].maxQueueWaitMilliseconds,
                 wait
             )
-            let isCurrent = generation == self.playbackGeneration
+            let isCurrent = self.isCurrent(ticket)
             self.playbackLock.unlock()
             // A preceding stop or explicit flush already accounted for an interrupted buffer.
-            guard isCurrent, let player = self.player else { return }
+            guard isCurrent else { return }
+            let player: AVAudioPlayerNode?
+            if let epoch = ticket.heldFnEpoch {
+                player = self.playerForHeldFn(epoch: epoch)
+            } else {
+                player = self.player
+            }
+            guard let player else {
+                if let epoch = ticket.heldFnEpoch { self.interruptHeldFnPlayback(ifCurrent: epoch) }
+                return
+            }
             player.scheduleBuffer(
                 buffer,
                 at: nil,
                 options: [],
                 completionCallbackType: .dataPlayedBack
-            ) { [weak self] _ in
-                self?.scheduledVoiceBufferDidFinish(
-                    sampleCount: sampleCount,
-                    generation: generation,
-                    deliveryGeneration: deliveryGeneration
-                )
+            ) { [weak self] callback in
+                self?.scheduledVoiceBufferDidFinish(ticket, playedBack: callback == .dataPlayedBack)
             }
         }
         return true
+    }
+
+    /// Opt-in only prepares a node on an already running output. It never opens
+    /// a device or starts an engine just for the optional voice route.
+    func setHeldFnPlaybackEnabled(_ enabled: Bool) {
+        playbackLock.lock()
+        wantsHeldFnPlayer = enabled
+        playbackLock.unlock()
+        engineQueue.async { [weak self] in self?.prepareHeldFnPlayerIfRequested() }
+    }
+
+    private func prepareHeldFnPlayerIfRequested() {
+        dispatchPrecondition(condition: .onQueue(engineQueue))
+        playbackLock.lock()
+        let requested = wantsHeldFnPlayer
+        let epoch = heldFnEpoch
+        playbackLock.unlock()
+        if requested {
+            _ = playerForHeldFn(epoch: epoch)
+        } else if let node = heldFnPlayer, heldFnPlayerEpoch != nil {
+            node.stop()
+            node.reset()
+            heldFnPlayerEpoch = nil
+        }
+    }
+
+    private func playerForHeldFn(epoch: UInt64) -> AVAudioPlayerNode? {
+        dispatchPrecondition(condition: .onQueue(engineQueue))
+        if heldFnPlayerEpoch == epoch { return heldFnPlayer }
+        guard engine?.isRunning == true, let node = heldFnPlayer else { return nil }
+        if heldFnPlayerEpoch != nil {
+            node.stop()
+            node.reset()
+        }
+        guard AudioPlayerNodeSafety.play(node) else {
+            heldFnPlayerEpoch = nil
+            return nil
+        }
+        heldFnPlayerEpoch = epoch
+        return node
+    }
+
+    // Wire both mono mixer inputs before starting an existing output engine.
+    // Connecting a second mono player to a live mixer can apply a different pan
+    // law (-3 dB). The reserved node remains stopped until the user opts in.
+    static func attachVoicePlayers(to engine: AVAudioEngine, format: AVAudioFormat)
+        -> (shared: AVAudioPlayerNode, heldFn: AVAudioPlayerNode) {
+        let player = AVAudioPlayerNode()
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
+        let heldFn = AVAudioPlayerNode()
+        let mixer = engine.mainMixerNode
+        engine.attach(heldFn)
+        engine.connect(heldFn, to: mixer, fromBus: 0, toBus: mixer.nextAvailableInputBus, format: format)
+        return (player, heldFn)
+    }
+
+    private func resetHeldFnPlayer(epoch: UInt64) {
+        guard heldFnPlayerEpoch == epoch, let node = heldFnPlayer else { return }
+        node.stop()
+        node.reset()
+        heldFnPlayerEpoch = nil
+        prepareHeldFnPlayerIfRequested()
+    }
+
+    private func detachHeldFnPlayer() {
+        dispatchPrecondition(condition: .onQueue(engineQueue))
+        guard let node = heldFnPlayer else { return }
+        heldFnPlayer = nil
+        heldFnPlayerEpoch = nil
+        node.stop()
+        engine?.detach(node)
+    }
+
+    /// Invalidate callbacks immediately. The completion is a physical fence: the
+    /// previous node has stopped and can no longer feed a subsequent Fn window.
+    func interruptHeldFnPlayback(ifCurrent expectedEpoch: UInt64? = nil, completion: (() -> Void)? = nil) {
+        playbackLock.lock()
+        if let expectedEpoch, expectedEpoch != heldFnEpoch {
+            playbackLock.unlock()
+            if let completion { DispatchQueue.main.async(execute: completion) }
+            return
+        }
+        let revokedEpoch = heldFnEpoch
+        heldFnEpoch &+= 1
+        let interrupted = pendingHeldFn
+        pendingHeldFn.removeAll()
+        for (delivery, count) in interrupted {
+            pendingVoiceBufferCount -= count.buffers
+            pendingVoiceSampleCount -= count.samples
+            playbackCounters.interruptedBuffers += count.buffers
+            playbackCounters.interruptedSamples += count.samples
+            playbackCountersByDeliveryGeneration[delivery, default: .init()].interruptedBuffers += count.buffers
+            playbackCountersByDeliveryGeneration[delivery, default: .init()].interruptedSamples += count.samples
+            subtract(count, from: &pendingByDeliveryGeneration, for: delivery)
+        }
+        if !interrupted.isEmpty, !drainRequests.isEmpty { drainSawInterruption = true }
+        let waitingDrain = pendingVoiceBufferCount == 0 && !drainRequests.isEmpty ? drainGeneration : nil
+        let contexts = !interrupted.isEmpty && pendingVoiceBufferCount == 0 ? pendingDrainLogContexts : []
+        if !contexts.isEmpty { pendingDrainLogContexts.removeAll() }
+        // Submit teardown under the same short lock as the epoch transition. A
+        // fresh enqueue can only be reserved after its predecessor's fence is queued.
+        engineQueue.async { [weak self] in
+            self?.resetHeldFnPlayer(epoch: revokedEpoch)
+            DispatchQueue.main.async {
+                if let waitingDrain { self?.finishDrainedSessionIfNeeded(generation: waitingDrain) }
+                completion?()
+            }
+        }
+        playbackLock.unlock()
+        for context in contexts { logger("AUDIO PLAYBACK interrupted " + context) }
+    }
+
+    private func subtract(
+        _ removed: PendingDeliveryCounters,
+        from counts: inout [Int: PendingDeliveryCounters], for generation: Int
+    ) {
+        guard var remaining = counts[generation] else { return }
+        remaining.buffers -= removed.buffers
+        remaining.samples -= removed.samples
+        counts[generation] = remaining.buffers > 0 ? remaining : nil
     }
 
     func endSession() {
@@ -1274,6 +1419,7 @@ final class VirtualAudioOutput {
         )
         let shouldCompleteImmediately = pendingVoiceBufferCount == 0
         let wasWaiting = !drainRequests.isEmpty
+        if !wasWaiting { drainSawInterruption = false }
         let pendingBuffers = pendingVoiceBufferCount
         let pendingSamples = pendingVoiceSampleCount
         let generation: UInt64?
@@ -1359,6 +1505,7 @@ final class VirtualAudioOutput {
         let interruptedSamples = pendingVoiceSampleCount
         playbackCounters.interruptedBuffers += pendingVoiceBufferCount
         playbackCounters.interruptedSamples += pendingVoiceSampleCount
+        let revokedHeldFnEpoch = heldFnEpoch
         recordPendingDeliveriesAsInterrupted()
         pendingVoiceBufferCount = 0
         pendingVoiceSampleCount = 0
@@ -1391,8 +1538,9 @@ final class VirtualAudioOutput {
             )
         }
         let restartPlayer = { [weak self] in
-            guard let self,
-                  let player = self.player,
+            guard let self else { return }
+            self.resetHeldFnPlayer(epoch: revokedHeldFnEpoch)
+            guard let player = self.player,
                   self.engine?.isRunning == true
             else { return }
             player.stop()
@@ -1467,6 +1615,7 @@ final class VirtualAudioOutput {
             )
         }
         removeEngineConfigurationObserver()
+        detachHeldFnPlayer()
         player?.stop()
         engine?.stop()
         player = nil
@@ -1481,15 +1630,22 @@ final class VirtualAudioOutput {
         }
     }
 
-    private func scheduledVoiceBufferDidFinish(
-        sampleCount: Int,
-        generation: UInt64,
-        deliveryGeneration: Int
-    ) {
+    private func isCurrent(_ ticket: VoiceBufferTicket) -> Bool {
+        ticket.playbackGeneration == playbackGeneration &&
+            (ticket.heldFnEpoch == nil || ticket.heldFnEpoch == heldFnEpoch)
+    }
+
+    func scheduledVoiceBufferDidFinish(_ ticket: VoiceBufferTicket, playedBack: Bool = true) {
+        if !playedBack, let epoch = ticket.heldFnEpoch {
+            interruptHeldFnPlayback(ifCurrent: epoch)
+            return
+        }
+        let sampleCount = ticket.sampleCount
+        let deliveryGeneration = ticket.deliveryGeneration
         var completionGeneration: UInt64?
         var drainedContexts: [String] = []
         playbackLock.lock()
-        guard generation == playbackGeneration else {
+        guard isCurrent(ticket) else {
             playbackLock.unlock()
             return
         }
@@ -1504,15 +1660,9 @@ final class VirtualAudioOutput {
         playbackCounters.playedSamples += sampleCount
         playbackCountersByDeliveryGeneration[deliveryGeneration, default: .init()].playedBuffers += 1
         playbackCountersByDeliveryGeneration[deliveryGeneration, default: .init()].playedSamples += sampleCount
-        if var pending = pendingByDeliveryGeneration[deliveryGeneration] {
-            pending.buffers = max(0, pending.buffers - 1)
-            pending.samples = max(0, pending.samples - sampleCount)
-            if pending.buffers == 0 && pending.samples == 0 {
-                pendingByDeliveryGeneration.removeValue(forKey: deliveryGeneration)
-            } else {
-                pendingByDeliveryGeneration[deliveryGeneration] = pending
-            }
-        }
+        let played = PendingDeliveryCounters(buffers: 1, samples: sampleCount)
+        subtract(played, from: &pendingByDeliveryGeneration, for: deliveryGeneration)
+        if ticket.heldFnEpoch != nil { subtract(played, from: &pendingHeldFn, for: deliveryGeneration) }
         if pendingVoiceBufferCount == 0 {
             drainedContexts = pendingDrainLogContexts
             pendingDrainLogContexts.removeAll()
@@ -1538,6 +1688,7 @@ final class VirtualAudioOutput {
         playbackLock.lock()
         let shouldFinish = generation == drainGeneration && pendingVoiceBufferCount == 0
         let requests = shouldFinish ? drainRequests : []
+        let interrupted = drainSawInterruption
         if shouldFinish {
             drainRequests.removeAll(keepingCapacity: true)
             drainGeneration &+= 1
@@ -1546,10 +1697,10 @@ final class VirtualAudioOutput {
         guard shouldFinish else { return }
         completeDrainRequests(
             requests,
-            outcome: .normal,
+            outcome: interrupted ? .forced : .normal,
             phase: "completed",
-            result: "normal",
-            reason: "buffers_drained",
+            result: interrupted ? "forced" : "normal",
+            reason: interrupted ? "held_fn_interrupted" : "buffers_drained",
             pendingBuffers: 0,
             pendingSamples: 0
         )
@@ -1656,6 +1807,10 @@ final class VirtualAudioOutput {
                       self.engineConfigurationGeneration == generation
                 else { return }
                 self.refreshOutputStateOnEngineQueue()
+                if let epoch = self.heldFnPlayerEpoch,
+                   !self.cachedOutputState.healthy || self.heldFnPlayer?.isPlaying != true {
+                    self.interruptHeldFnPlayback(ifCurrent: epoch)
+                }
                 self.logger(
                     "AUDIO ENGINE configuration_changed generation=\(generation) " +
                         "phase=observed result=pending queue=audio_output"
@@ -1729,6 +1884,8 @@ final class VirtualAudioOutput {
             playbackCountersByDeliveryGeneration[generation, default: .init()].interruptedSamples += pending.samples
         }
         pendingByDeliveryGeneration.removeAll(keepingCapacity: true)
+        pendingHeldFn.removeAll()
+        heldFnEpoch &+= 1
     }
 
     func atvvPlaybackObservation(deliveryGeneration: Int) -> ATVVAudioDiagnostics.Playback {

@@ -35,7 +35,23 @@ final class RC003HeldFnSession {
     private var presses: [Press] = []
     private var bufferedSamples = 0
 
-    var isBusy: Bool { !presses.isEmpty }
+    private var outputReset: UInt64?
+    private var nextReset: UInt64 = 0
+
+    var isBusy: Bool { !presses.isEmpty || outputReset != nil }
+
+    /// Capture a new physical press immediately, but never open a new target
+    /// window while an invalidated player can still render the old generation.
+    func waitForOutputReset(_ reset: (@escaping () -> Void) -> Void) {
+        nextReset &+= 1
+        let token = nextReset
+        outputReset = token
+        reset { [weak self] in
+            guard let self, self.outputReset == token else { return }
+            self.outputReset = nil
+            if let next = self.presses.first { _ = self.pressKey(next) } else { self.onIdle() }
+        }
+    }
 
     init(
         playback: @escaping (Int) -> Playback,
@@ -62,7 +78,7 @@ final class RC003HeldFnSession {
         }
         let press = Press(setKey: setKey)
         presses.append(press)
-        guard presses.first === press else { return true }
+        guard presses.first === press, outputReset == nil else { return true }
         return pressKey(press)
     }
 
@@ -95,10 +111,10 @@ final class RC003HeldFnSession {
     func stop(deliveryGeneration: Int) {
         guard let press = presses.last, press.stoppedGeneration == nil else { return }
         press.stoppedGeneration = deliveryGeneration
-        if presses.first === press { waitForPlayback(press) }
+        if presses.first === press, press.isHeld { waitForPlayback(press) }
     }
 
-    func cancel() {
+    func cancel(notifyIdle: Bool = true) {
         guard !presses.isEmpty else { return }
         let pending = presses
         presses.removeAll()
@@ -110,7 +126,7 @@ final class RC003HeldFnSession {
             }
             press.buffered.forEach { $0.discard($0.samples.count) }
         }
-        onIdle()
+        if notifyIdle, outputReset == nil { onIdle() }
     }
 
     private func pressKey(_ press: Press) -> Bool {
@@ -173,7 +189,7 @@ final class RC003HeldFnSession {
     }
 
     private func abort(_ reason: String) {
-        cancel()
+        cancel(notifyIdle: false)
         onAbort(reason)
     }
 }

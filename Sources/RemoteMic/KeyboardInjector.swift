@@ -253,11 +253,20 @@ enum KeyboardInjector {
     static func setVoiceKeyPressed(
         _ mode: VoiceKeyMode,
         isPressed: Bool,
+        preservingPhysicalModifiers: Bool = false,
         accessibilityTrusted: () -> Bool = { isAccessibilityTrusted },
         keyStatePoster: KeyStatePoster = postKeyState
     ) -> Bool {
         guard accessibilityTrusted() else { return false }
-        let flags = isPressed ? mode.eventFlags : []
+        let flags: CGEventFlags
+        if preservingPhysicalModifiers, mode == .function {
+            guard let preserved = ShortcutEventSequence.managedFunctionFlags(
+                pressed: isPressed, raw: CGEventSource.flagsState(.hidSystemState)
+            ) else { return false }
+            flags = preserved
+        } else {
+            flags = isPressed ? mode.eventFlags : []
+        }
         return keyStatePoster(
             mode.keyCode,
             isPressed,
