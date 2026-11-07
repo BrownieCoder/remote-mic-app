@@ -339,6 +339,7 @@ struct TranscriptCaptureCoordinatorTests {
         }
         #expect(disabled.snapshotReads == 0)
         #expect(disabled.captures.isEmpty)
+        #expect(disabled.scheduler.scheduledCount == 0)
 
         enabled.coordinator.startSession(startedAt: Date(), source: .bluetoothRemote, managedFnWaitingForOutput: false)
         enabled.snapshot = CaptureHarness.safeSnapshot(text: "AB", selection: NSRange(location: 2, length: 0))
@@ -501,6 +502,90 @@ struct TranscriptCaptureCoordinatorTests {
         #expect(h.captures.isEmpty)
     }
 
+    @Test func enablingHistoryInsideAnUnobservedManagedWindowSkipsOrdinaryPresses() {
+        for interrupted in [false, true] {
+            let h = CaptureHarness(enabled: false)
+            h.snapshot = CaptureHarness.safeSnapshot(text: "", selection: .init(location: 0, length: 0))
+            h.coordinator.startSession(startedAt: Date(), source: .bluetoothRemote, managedFnWaitingForOutput: false)
+            h.scheduler.advance(by: 0.11)
+            h.coordinator.finishSession(endedAt: Date(), managedFnOutputPending: interrupted)
+            if interrupted {
+                h.coordinator.managedOutputWasInterrupted()
+                h.coordinator.managedOutputDidBecomeIdle()
+            }
+            h.enabled = true
+            h.scheduler.advance(by: 0.07)
+            h.ordinaryInput(inserting: "A")
+            h.ordinaryInput(inserting: "B")
+            #expect(h.captures.isEmpty)
+            #expect(h.snapshotReads == 0)
+            #expect(h.scheduler.scheduledCount == 0)
+            h.scheduler.advance(by: 5)
+            let last = h.ordinaryInput(inserting: "D")
+            #expect(h.captures.map(\.sessionID) == [last])
+            #expect(h.captures.map(\.text) == ["D"])
+        }
+    }
+
+    @Test func disabledManagedPlaybackProtectsOrdinaryInputUntilItsActualIdle() {
+        for interrupted in [false, true] {
+            let h = CaptureHarness(enabled: false)
+            h.snapshot = CaptureHarness.safeSnapshot(text: "", selection: .init(location: 0, length: 0))
+            h.coordinator.startSession(startedAt: Date(), source: .bluetoothRemote, managedFnWaitingForOutput: false)
+            h.coordinator.finishSession(endedAt: Date(), managedFnOutputPending: true)
+            if interrupted { h.coordinator.managedOutputWasInterrupted() }
+            h.scheduler.advance(by: interrupted ? 5 : 12)
+            h.enabled = true
+            h.ordinaryInput(inserting: "A")
+            if interrupted { h.scheduler.advance(by: 3) }
+            h.coordinator.managedOutputDidBecomeIdle()
+            h.scheduler.advance(by: 7.99)
+            h.ordinaryInput(inserting: "B")
+            #expect(h.snapshotReads == 0)
+            #expect(h.scheduler.scheduledCount == 0)
+            let last = h.ordinaryInput(inserting: "D")
+            #expect(h.captures.map(\.sessionID) == [last])
+            #expect(h.captures.map(\.text) == ["D"])
+        }
+    }
+
+    @Test func cancelledOrInterruptedUnobservedOutputRecoversWithoutAnIdleCallback() {
+        enum StopOrder: CaseIterable { case beforeTerminal, afterTerminal, missing }
+        for useCancel in [false, true] {
+            for order in StopOrder.allCases {
+                let h = CaptureHarness(enabled: false)
+                h.snapshot = CaptureHarness.safeSnapshot(text: "", selection: .init(location: 0, length: 0))
+                h.coordinator.startSession(startedAt: Date(), source: .bluetoothRemote, managedFnWaitingForOutput: false)
+                if order == .beforeTerminal { h.coordinator.finishSession(endedAt: Date(), managedFnOutputPending: true) }
+                if useCancel { h.coordinator.cancel() } else { h.coordinator.managedOutputWasInterrupted() }
+                h.scheduler.advance(by: 4)
+                if order == .afterTerminal { h.coordinator.finishSession(endedAt: Date(), managedFnOutputPending: true) }
+                h.scheduler.advance(by: order == .afterTerminal ? 7.99 : 3.99)
+                h.enabled = true
+                h.ordinaryInput(inserting: "A")
+                #expect(h.snapshotReads == 0)
+                #expect(h.scheduler.scheduledCount == 0)
+                let last = h.ordinaryInput(inserting: "C")
+                #expect(h.captures.map(\.sessionID) == [last])
+                #expect(h.captures.map(\.text) == ["C"])
+            }
+        }
+    }
+
+    @Test func enablingAfterAnUnobservedManagedWindowCapturesTheFirstOrdinaryInput() {
+        let h = CaptureHarness(enabled: false)
+        h.snapshot = CaptureHarness.safeSnapshot(text: "", selection: .init(location: 0, length: 0))
+        h.coordinator.startSession(startedAt: Date(), source: .bluetoothRemote, managedFnWaitingForOutput: false)
+        h.coordinator.finishSession(endedAt: Date())
+        h.scheduler.advance(by: 8.01)
+        #expect(h.snapshotReads == 0)
+        #expect(h.scheduler.scheduledCount == 0)
+        h.enabled = true
+        let next = h.ordinaryInput(inserting: "B")
+        #expect(h.captures.map(\.sessionID) == [next])
+        #expect(h.captures.map(\.text) == ["B"])
+    }
+
     @Test func unavailableInitialFocusEndsWithADiagnosticReason() {
         let harness = CaptureHarness(initialSnapshotTimeout: 0.5)
         harness.snapshot = nil
@@ -546,6 +631,17 @@ private final class CaptureHarness {
             isSafeEditableDestination: true
         )
     }
+
+    @discardableResult
+    func ordinaryInput(inserting marker: String) -> UUID {
+        let id = UUID()
+        coordinator.startSession(sessionID: id, startedAt: Date(), source: .bluetoothRemote)
+        let text = (snapshot?.text ?? "") + marker
+        snapshot = Self.safeSnapshot(text: text, selection: .init(location: text.utf16.count, length: 0))
+        coordinator.finishSession(endedAt: Date())
+        scheduler.advance(by: 1.5)
+        return id
+    }
 }
 
 private final class TranscriptManualScheduler {
@@ -556,13 +652,13 @@ private final class TranscriptManualScheduler {
     }
 
     private(set) var currentTime: TimeInterval = 0
-    private var nextID = 0
+    private(set) var scheduledCount = 0
     private var entries: [Entry] = []
     private var cancelledIDs = Set<Int>()
 
     lazy var schedule: TranscriptCaptureCoordinator.Scheduler = { [unowned self] delay, operation in
-        nextID += 1
-        let id = nextID
+        scheduledCount += 1
+        let id = scheduledCount
         entries.append(Entry(id: id, deadline: currentTime + delay, operation: operation))
         return VoiceFnTapScheduledTask { [weak self] in
             self?.cancelledIDs.insert(id)

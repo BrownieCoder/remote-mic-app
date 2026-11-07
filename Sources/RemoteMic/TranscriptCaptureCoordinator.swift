@@ -220,7 +220,7 @@ final class TranscriptCaptureCoordinator {
     private var managedCapture: ManagedCapture?
     private var managedResultID: UUID?
     private struct ManagedEnd {
-        let endedAt: Date
+        let observedEnd: Date?
         var cancelled = false
     }
     private var pendingManagedEnd: ManagedEnd?
@@ -262,22 +262,16 @@ final class TranscriptCaptureCoordinator {
         if pendingManagedEnd?.cancelled == true, clock() >= skipManagedUntil {
             pendingManagedEnd = nil
         }
-        let previousManagedCapture = managedCapture != nil || pendingManagedEnd != nil
-        let previousManagedWindow = previousManagedCapture || clock() < skipManagedUntil
+        let previousManagedWindow = managedCapture != nil || pendingManagedEnd != nil || clock() < skipManagedUntil
         if managedFnWaitingForOutput != nil || previousManagedWindow {
-            guard isEnabled() else {
-                if managedCapture != nil { skipManagedUntil = clock() + totalTimeout }
-                managedCapture = nil
-                clearState()
-                log("TRANSCRIPT CAPTURE skipped reason=feature_disabled")
-                return
-            }
+            let enabled = isEnabled()
             // The editor has no per-press result identity. Never open a new
             // snapshot window over a managed result, including after hardware fallback.
             let managedOverlap = managedFnWaitingForOutput.map { $0 || pendingSession != nil || activeSession != nil } ?? false
-            if previousManagedWindow || managedOverlap {
+            if !enabled || previousManagedWindow || managedOverlap {
                 clearState()
                 if managedFnWaitingForOutput != nil {
+                    // Even with history off, remember only the press/output boundary.
                     managedCapture = .skipped
                     pendingManagedEnd = nil
                 } else {
@@ -286,7 +280,8 @@ final class TranscriptCaptureCoordinator {
                     if managedCapture != nil { skipManagedUntil = clock() + totalTimeout }
                     managedCapture = nil
                 }
-                log("TRANSCRIPT CAPTURE skipped reason=managed_fn_overlapping_results")
+                let reason = enabled ? "managed_fn_overlapping_results" : "feature_disabled"
+                log("TRANSCRIPT CAPTURE skipped reason=\(reason)")
                 return
             }
             managedCapture = .observing
@@ -343,7 +338,10 @@ final class TranscriptCaptureCoordinator {
     func finishSession(endedAt: Date, managedFnOutputPending: Bool = false) {
         if let capture = managedCapture {
             if managedFnOutputPending {
-                pendingManagedEnd = ManagedEnd(endedAt: endedAt)
+                let cancelled = capture == .cancelled
+                pendingManagedEnd = ManagedEnd(observedEnd: capture == .observing ? endedAt : nil,
+                                               cancelled: cancelled)
+                if cancelled { skipManagedUntil = clock() + totalTimeout }
                 return
             }
             managedCapture = nil
@@ -369,17 +367,18 @@ final class TranscriptCaptureCoordinator {
     func managedOutputDidBecomeIdle() {
         guard let end = pendingManagedEnd else { return }
         pendingManagedEnd = nil
-        if managedCapture != nil {
-            finishSession(endedAt: end.endedAt)
+        if managedCapture == .observing, let observedEnd = end.observedEnd {
+            finishSession(endedAt: observedEnd)
         } else {
+            managedCapture = nil
             skipManagedUntil = clock() + totalTimeout
         }
     }
 
     func managedOutputWasInterrupted() {
-        guard managedCapture == .observing else { return }
+        guard managedCapture != nil || pendingManagedEnd != nil else { return }
+        cancelManagedObservation()
         clearState()
-        managedCapture = .skipped
         log("TRANSCRIPT CAPTURE skipped reason=managed_fn_interrupted")
     }
 
@@ -398,16 +397,20 @@ final class TranscriptCaptureCoordinator {
 
     func cancel(reason: String = "external") {
         let hadSession = pendingSession != nil || activeSession != nil
-        if let capture = managedCapture, capture != .cancelled {
-            skipManagedUntil = clock() + totalTimeout
-            managedCapture = .cancelled
-            // A discarded output may never send its remaining idle callback.
-            pendingManagedEnd?.cancelled = true
-        }
+        cancelManagedObservation()
         clearState()
         if hadSession {
             log("TRANSCRIPT CAPTURE canceled reason=\(reason)")
         }
+    }
+
+    private func cancelManagedObservation() {
+        let hasPress = managedCapture != nil && managedCapture != .cancelled
+        guard hasPress || pendingManagedEnd?.cancelled == false else { return }
+        // A terminal route may never deliver its promised idle callback.
+        skipManagedUntil = clock() + totalTimeout
+        if hasPress { managedCapture = .cancelled }
+        pendingManagedEnd?.cancelled = true
     }
 
     private func clearState() {
