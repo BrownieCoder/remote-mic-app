@@ -7,14 +7,17 @@ struct RC003HeldFnSessionTests {
         var events: [String] = []
         var pending: [Int: Int] = [:]
         var interrupted: Set<Int> = []
+        var presentation: [Int: TimeInterval] = [:]
         var callbacks: [() -> Void] = []
+        var delays: [TimeInterval] = []
         var time: TimeInterval = 0
         lazy var session = RC003HeldFnSession(
             playback: { generation in
-                .init(pendingSamples: self.pending[generation, default: 0], interrupted: self.interrupted.contains(generation))
+                .init(pendingSamples: self.pending[generation, default: 0], interrupted: self.interrupted.contains(generation),
+                      presentationDelay: self.presentation[generation])
             },
             now: { self.time },
-            schedule: { _, callback in self.callbacks.append(callback) },
+            schedule: { delay, callback in self.delays.append(delay); self.callbacks.append(callback) },
             onAbort: { self.events.append($0) }
         )
         func begin(_ label: String) -> Bool {
@@ -58,6 +61,55 @@ struct RC003HeldFnSessionTests {
         #expect(f.events == ["a-down"])
         f.session.stop(deliveryGeneration: 8)
         #expect(f.events == ["a-down", "a-up"])
+        #expect(f.callbacks.isEmpty)
+    }
+
+    @Test func earlyPlayedBackWaitsForItsSubmittedDeviceBlockBeforeBothKeyEdges() {
+        let f = Fixture()
+        #expect(f.begin("a"))
+        f.audio(1, 9000)
+        f.pending[1] = 0
+        f.presentation[1] = 0.004813
+        f.session.stop(deliveryGeneration: 1)
+        #expect(f.begin("b"))
+        f.audio(2, -6000)
+        #expect(f.events == ["a-down", "audio-1-9000"])
+        #expect(f.delays == [0.004813])
+        f.presentation[1] = nil
+        f.tick(5)
+        #expect(f.events == ["a-down", "audio-1-9000", "a-up", "b-down", "audio-2--6000"])
+    }
+
+    @Test func presentationUsesThisDeliveriesOccupiedFramesAndAnIdleConverterBlock() {
+        // A previously presented block cannot acknowledge a new all-zero buffer.
+        #expect(VirtualAudioOutput.presentationDelay(previousEnd: 100, occupiedThrough: 100,
+                                                      renderedThrough: 200, now: 210) == 0)
+        #expect(VirtualAudioOutput.presentationDelay(previousEnd: 100, occupiedThrough: 350,
+                                                      renderedThrough: 350, now: 360) == 0)
+        #expect((VirtualAudioOutput.presentationDelay(previousEnd: 100, occupiedThrough: 350,
+                                                       renderedThrough: 450, now: 325) ?? 0) > 0)
+        #expect(VirtualAudioOutput.presentationDelay(previousEnd: 100, occupiedThrough: 350,
+                                                      renderedThrough: 450, now: 360) == nil)
+    }
+
+    @Test func anAllZeroBufferWaitsForItsDeviceBlockButAPresentedTailReleasesImmediately() {
+        let f = Fixture()
+        #expect(f.begin("silent"))
+        f.audio(1, 0)
+        f.pending[1] = 0
+        f.presentation[1] = 0
+        f.session.stop(deliveryGeneration: 1)
+        #expect(f.events == ["silent-down", "audio-1-0"])
+        f.presentation[1] = nil
+        f.tick(8)
+        #expect(f.events.last == "silent-up")
+
+        #expect(f.begin("complete"))
+        f.audio(2, 19)
+        f.audio(2, 0)
+        f.pending[2] = 0
+        f.session.stop(deliveryGeneration: 2)
+        #expect(f.events.last == "complete-up")
         #expect(f.callbacks.isEmpty)
     }
 

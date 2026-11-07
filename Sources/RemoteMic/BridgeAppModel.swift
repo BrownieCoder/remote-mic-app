@@ -673,13 +673,13 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     private let rc003HIDTopology = RC003HIDTopologyMonitor()
     private let rc003HeldFnMapper = RemoteNativeKeyMapper(
         family: "xiaomi_rc003_voice", mappings: [RemoteVoiceFunctionMappingPolicy.neutralRemoteVoiceKey],
+        exclusiveOriginal: RemoteVoiceFunctionMappingPolicy.remoteVoiceKey,
         recoveryKey: "sayall.rc003-held-fn-recovery.v1"
     )
     private lazy var rc003HeldFnSession = RC003HeldFnSession(
         playback: { [weak self] generation in
             guard let self else { return .init(pendingSamples: 0, interrupted: true) }
-            let snapshot = self.audioOutput.diagnosticSnapshot(deliveryGeneration: generation)
-            return .init(pendingSamples: snapshot.pendingSamples, interrupted: snapshot.counters.interruptedSamples > 0)
+            return self.audioOutput.heldFnPlayback(deliveryGeneration: generation)
         },
         onAbort: { [weak self] reason in self?.disableRC003HeldFn(reason: reason) },
         onIdle: { [weak self] in

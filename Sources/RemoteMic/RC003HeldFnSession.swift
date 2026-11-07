@@ -6,6 +6,9 @@ final class RC003HeldFnSession {
     struct Playback {
         let pendingSamples: Int
         let interrupted: Bool
+        // nil once presented, zero while awaiting a render observation, or
+        // the remaining wall time to the last device block already submitted.
+        var presentationDelay: TimeInterval? = nil
     }
 
     private struct BufferedAudio {
@@ -158,7 +161,7 @@ final class RC003HeldFnSession {
             abort("playback_interrupted")
             return
         }
-        guard output.pendingSamples > 0 else {
+        guard output.pendingSamples > 0 || output.presentationDelay != nil else {
             guard press.setKey(false) else {
                 abort("fn_up_failed")
                 return
@@ -176,13 +179,14 @@ final class RC003HeldFnSession {
                 return
             }
         } else {
-            // Only a watchdog. A healthy generation releases as soon as its last
-            // dataPlayedBack callback settles, irrespective of later generations.
+            // Only a watchdog. Normal completion follows the device timeline.
             let queuedSeconds = Double(output.pendingSamples) / 16_000
             press.deadline = uptime + min(2, queuedSeconds + 0.75)
             press.lastPendingSamples = output.pendingSamples
         }
-        schedule(0.008) { [weak self, weak press] in
+        let delay = output.pendingSamples == 0 ? output.presentationDelay ?? 0 : 0
+        let untilWatchdog = max(0, (press.deadline ?? uptime) - uptime)
+        schedule(delay > 0 ? min(delay, untilWatchdog) : 0.008) { [weak self, weak press] in
             guard let press else { return }
             self?.waitForPlayback(press)
         }

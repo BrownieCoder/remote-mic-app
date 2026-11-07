@@ -1,4 +1,5 @@
 #import <AVFAudio/AVFAudio.h>
+#import "RemoteMicAudioRenderClock.h"
 
 NS_ASSUME_NONNULL_BEGIN
 

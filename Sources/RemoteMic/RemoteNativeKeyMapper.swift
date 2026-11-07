@@ -23,6 +23,7 @@ final class RemoteNativeKeyMapper {
     private var recordedSources: Set<UInt64>
     private var desiredMappings: [HIDUsageMapping] { sources.sorted().map { HIDUsageMapping(source: $0, destination: 0) } }
     private let services: RemoteVoiceFunctionMapper.ServiceProvider
+    private let exclusiveOriginal: HIDUsageMapping?
     private let bootSession: String?
     private let writeState: (Data) -> Bool
     private let logger: (String) -> Void
@@ -33,6 +34,7 @@ final class RemoteNativeKeyMapper {
     init(
         family: String = "xiaomi",
         mappings: [HIDUsageMapping] = RemoteNativeKeyMapper.mappings,
+        exclusiveOriginal: HIDUsageMapping? = nil,
         recoveryKey: String = RemoteNativeKeyMapper.recoveryKey,
         serviceProvider: @escaping RemoteVoiceFunctionMapper.ServiceProvider = RemoteVoiceFunctionMapper.systemServices,
         defaults: UserDefaults = .standard,
@@ -43,6 +45,7 @@ final class RemoteNativeKeyMapper {
         sources = Set(mappings.map(\.source))
         recordedSources = sources
         services = serviceProvider
+        self.exclusiveOriginal = exclusiveOriginal
         self.bootSession = bootSession
         self.logger = { logger("\($0) family=\(family)") }
         self.writeState = writeState ?? { data in
@@ -84,7 +87,16 @@ final class RemoteNativeKeyMapper {
                 log("prepare", result: "failed", reason: "service_identity_unavailable")
                 return false
             }
-            let current = nativeMappings(in: service.readMappings())
+            let mappings = service.readMappings()
+            if let original = exclusiveOriginal {
+                let relevant = mappings.filter { $0.source == original.source || $0.destination == original.destination }
+                let alreadyOwned = originals[id]?.contains(original) == true && relevant == desiredMappings
+                guard relevant == [original] || alreadyOwned else {
+                    log("prepare", result: "failed", reason: "ambiguous_original_mapping")
+                    return false
+                }
+            }
+            let current = nativeMappings(in: mappings)
             before[id] = current
             if let previous = originals[id] {
                 // Preserve a new external mapping rather than restoring over it later.
@@ -106,11 +118,11 @@ final class RemoteNativeKeyMapper {
         var attempted: [RemoteVoiceMappingService] = []
         for service in targets {
             let current = service.readMappings()
-            if matches(nativeMappings(in: current), desiredMappings) { continue }
+            if hasDesiredMappings(in: current) { continue }
             attempted.append(service)
             let desired = replacingNativeMappings(in: current, with: desiredMappings)
-            guard service.setMappings(desired),
-                  matches(nativeMappings(in: service.readMappings()), desiredMappings) else {
+            guard hasDesiredMappings(in: desired), service.setMappings(desired),
+                  hasDesiredMappings(in: service.readMappings()) else {
                 var restored = 0
                 for target in attempted.reversed() {
                     guard let id = target.registryID, let snapshot = before[id] else { continue }
@@ -138,8 +150,15 @@ final class RemoteNativeKeyMapper {
         guard isPrepared, !targets.isEmpty else { return false }
         return targets.allSatisfy { target in
             guard let id = target.registryID, originals[id] != nil else { return false }
-            return matches(nativeMappings(in: target.readMappings()), desiredMappings)
+            return hasDesiredMappings(in: target.readMappings())
         }
+    }
+
+    private func hasDesiredMappings(in mappings: [HIDUsageMapping]) -> Bool {
+        if let original = exclusiveOriginal, mappings.contains(where: { $0.destination == original.destination }) {
+            return false
+        }
+        return matches(nativeMappings(in: mappings), desiredMappings)
     }
 
     /// Restore owned ordinary-key mappings, retaining voice and external edits.

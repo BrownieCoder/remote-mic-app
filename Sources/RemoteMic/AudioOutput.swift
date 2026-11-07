@@ -816,6 +816,20 @@ final class VirtualAudioOutput {
     // Only opted-in RC003 audio uses this node. Its queue can be revoked without
     // stopping unrelated voice streams or an in-flight test tone on the original node.
     private var heldFnPlayer: AVAudioPlayerNode?
+    private var heldFnMixer: AVAudioMixerNode?
+    private var heldFnClock: RemoteMicAudioRenderClock?
+    private struct HeldFnDelivery {
+        let generation: Int
+        let epoch: UInt64
+        let clock: RemoteMicAudioRenderClock
+        let initialClockErrors: UInt64
+        var lastScheduleEnd: UInt64
+    }
+    // Protected by playbackLock. Normal sessions submit only one generation
+    // to the reserved player at a time, including across a rapid re-press.
+    private var heldFnDelivery: HeldFnDelivery?
+    private var interruptedHeldFnDelivery: Int?
+    private var retiredHeldFnOutputEnd: UInt64 = 0
     private var heldFnPlayerEpoch: UInt64?
     private var heldFnEpoch: UInt64 = 0
     private var wantsHeldFnPlayer = false
@@ -899,6 +913,17 @@ final class VirtualAudioOutput {
         self.uptime = uptime
         self.engineQueue = engineQueue
         engineQueue.setSpecific(key: engineQueueKey, value: ())
+    }
+
+    deinit {
+        // The owner can disappear from a callback or the main queue without
+        // calling stop(). Keep the engine and observer alive until I/O stops.
+        if let engine, let clock = heldFnClock {
+            engineQueue.async {
+                engine.stop()
+                clock.invalidate()
+            }
+        }
     }
 
     @discardableResult
@@ -1100,6 +1125,7 @@ final class VirtualAudioOutput {
             return false
         }
 
+        let reservedMixer = connectHeldFnPresentationMixer(to: engine, player: reservedHeldFnPlayer)
         do {
             logStage("prepare_engine")
             engine.prepare()
@@ -1120,6 +1146,7 @@ final class VirtualAudioOutput {
             self.engine = engine
             self.player = player
             self.heldFnPlayer = reservedHeldFnPlayer
+            self.heldFnMixer = reservedMixer
             prepareHeldFnPlayerIfRequested()
             updateOutputState { $0.selectedDevice = device }
             logStage("verify_output")
@@ -1249,6 +1276,20 @@ final class VirtualAudioOutput {
                 if let epoch = ticket.heldFnEpoch { self.interruptHeldFnPlayback(ifCurrent: epoch) }
                 return
             }
+            if let epoch = ticket.heldFnEpoch, let clock = self.heldFnClock {
+                let position = clock.position
+                self.playbackLock.lock()
+                if self.heldFnDelivery?.generation != deliveryGeneration || self.heldFnDelivery?.epoch != epoch {
+                    self.heldFnDelivery = .init(generation: deliveryGeneration, epoch: epoch,
+                                                clock: clock, initialClockErrors: position.clockErrors,
+                                                lastScheduleEnd: position.occupiedThrough)
+                } else {
+                    // After an underrun, the quiet block from the previous
+                    // packet cannot acknowledge the newly scheduled tail.
+                    self.heldFnDelivery?.lastScheduleEnd = position.occupiedThrough
+                }
+                self.playbackLock.unlock()
+            }
             player.scheduleBuffer(
                 buffer,
                 at: nil,
@@ -1288,7 +1329,16 @@ final class VirtualAudioOutput {
     private func playerForHeldFn(epoch: UInt64) -> AVAudioPlayerNode? {
         dispatchPrecondition(condition: .onQueue(engineQueue))
         if heldFnPlayerEpoch == epoch { return heldFnPlayer }
-        guard engine?.isRunning == true, let node = heldFnPlayer else { return nil }
+        guard let engine, engine.isRunning, let node = heldFnPlayer else { return nil }
+        if !engine.isInManualRenderingMode, heldFnClock == nil {
+            guard let mixer = heldFnMixer else { return nil }
+            let rate = mixer.outputFormat(forBus: 0).sampleRate
+            guard rate == engine.outputNode.outputFormat(forBus: 0).sampleRate,
+                  rate == engine.mainMixerNode.outputFormat(forBus: 0).sampleRate,
+                  let clock = RemoteMicAudioRenderClock(mixer: mixer, sampleRate: rate,
+                                                       latency: engine.outputNode.presentationLatency) else { return nil }
+            heldFnClock = clock
+        }
         if heldFnPlayerEpoch != nil {
             node.stop()
             node.reset()
@@ -1316,10 +1366,26 @@ final class VirtualAudioOutput {
         return (player, heldFn)
     }
 
+    // Select the standard output route first. Before starting the engine,
+    // move only the reserved player's converter upstream of the clock.
+    private func connectHeldFnPresentationMixer(to engine: AVAudioEngine, player: AVAudioPlayerNode) -> AVAudioMixerNode? {
+        let hardware = engine.outputNode.outputFormat(forBus: 0)
+        guard hardware.sampleRate > 0, hardware.channelCount > 0,
+              let native = AVAudioFormat(standardFormatWithSampleRate: hardware.sampleRate, channels: hardware.channelCount),
+              let bus = engine.outputConnectionPoints(for: player, outputBus: 0).first?.bus else { return nil }
+        let mixer = AVAudioMixerNode()
+        engine.disconnectNodeOutput(player)
+        engine.attach(mixer)
+        engine.connect(player, to: mixer, format: sourceFormat)
+        engine.connect(mixer, to: engine.mainMixerNode, fromBus: 0, toBus: bus, format: native)
+        return mixer
+    }
+
     private func resetHeldFnPlayer(epoch: UInt64) {
         guard heldFnPlayerEpoch == epoch, let node = heldFnPlayer else { return }
         node.stop()
         node.reset()
+        heldFnMixer?.reset()
         heldFnPlayerEpoch = nil
         prepareHeldFnPlayerIfRequested()
     }
@@ -1331,6 +1397,49 @@ final class VirtualAudioOutput {
         heldFnPlayerEpoch = nil
         node.stop()
         engine?.detach(node)
+        heldFnMixer = nil
+        heldFnClock?.invalidate()
+        heldFnClock = nil
+    }
+
+    // A dataPlayedBack notification may precede the end of the submitted
+    // output quantum. Recheck its absolute device time, including the private
+    // converter's final block. An already presented or empty session is ready.
+    func heldFnPlayback(deliveryGeneration: Int) -> RC003HeldFnSession.Playback {
+        playbackLock.lock()
+        defer { playbackLock.unlock() }
+        let pending = pendingByDeliveryGeneration[deliveryGeneration]?.samples ?? 0
+        let interrupted = interruptedHeldFnDelivery == deliveryGeneration ||
+            (playbackCountersByDeliveryGeneration[deliveryGeneration]?.interruptedSamples ?? 0) > 0
+        guard let delivery = heldFnDelivery, delivery.generation == deliveryGeneration else {
+            return .init(pendingSamples: pending, interrupted: interrupted)
+        }
+        let position = delivery.clock.position
+        return .init(pendingSamples: pending, interrupted: interrupted || position.clockErrors != delivery.initialClockErrors,
+                     presentationDelay: Self.presentationDelay(previousEnd: delivery.lastScheduleEnd,
+                          occupiedThrough: position.occupiedThrough, renderedThrough: position.renderedThrough,
+                          now: mach_absolute_time()))
+    }
+
+    static func presentationDelay(previousEnd: UInt64, occupiedThrough: UInt64,
+                                  renderedThrough: UInt64, now: UInt64) -> TimeInterval? {
+        guard occupiedThrough > previousEnd else { return 0 }
+        if occupiedThrough > now { return AVAudioTime.seconds(forHostTime: occupiedThrough - now) }
+        return renderedThrough > occupiedThrough ? nil : 0
+    }
+
+    // Call after the private player and its converter stop. Frames already
+    // handed to the device survive a node reset or an engine replacement.
+    private func retireHeldFnDelivery() -> UInt64 {
+        playbackLock.lock()
+        defer { playbackLock.unlock() }
+        if let delivery = heldFnDelivery {
+            let position = delivery.clock.position
+            retiredHeldFnOutputEnd = max(retiredHeldFnOutputEnd, position.occupiedThrough, position.renderingThrough)
+            interruptedHeldFnDelivery = delivery.generation
+            heldFnDelivery = nil
+        }
+        return retiredHeldFnOutputEnd
     }
 
     /// Invalidate callbacks immediately. The completion is a physical fence: the
@@ -1363,7 +1472,10 @@ final class VirtualAudioOutput {
         // fresh enqueue can only be reserved after its predecessor's fence is queued.
         engineQueue.async { [weak self] in
             self?.resetHeldFnPlayer(epoch: revokedEpoch)
-            DispatchQueue.main.async {
+            let end = self?.retireHeldFnDelivery() ?? 0
+            let now = mach_absolute_time()
+            let delay = end > now ? AVAudioTime.seconds(forHostTime: end - now) : 0
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 if let waitingDrain { self?.finishDrainedSessionIfNeeded(generation: waitingDrain) }
                 completion?()
             }
@@ -1540,6 +1652,7 @@ final class VirtualAudioOutput {
         let restartPlayer = { [weak self] in
             guard let self else { return }
             self.resetHeldFnPlayer(epoch: revokedHeldFnEpoch)
+            _ = self.retireHeldFnDelivery()
             guard let player = self.player,
                   self.engine?.isRunning == true
             else { return }
@@ -1615,9 +1728,10 @@ final class VirtualAudioOutput {
             )
         }
         removeEngineConfigurationObserver()
-        detachHeldFnPlayer()
         player?.stop()
         engine?.stop()
+        _ = retireHeldFnDelivery()
+        detachHeldFnPlayer()
         player = nil
         engine = nil
         updateOutputState {

@@ -24,6 +24,30 @@ struct RemoteNativeKeyMapperTests {
         #expect(device.mappings.sorted { $0.source < $1.source } == original.sorted { $0.source < $1.source })
     }
 
+    @Test func exclusiveVoiceMappingRejectsOtherFnSourcesAndRechecksExternalChanges() throws {
+        let store = try testDefaults()
+        defer { store.cleanup() }
+        let voice = RemoteVoiceFunctionMappingPolicy.remoteVoiceKey
+        let neutral = RemoteVoiceFunctionMappingPolicy.neutralRemoteVoiceKey
+        let other = HIDUsageMapping(source: 0x0000_0007_0000_000c, destination: voice.destination)
+        let device = NativeServiceBox(id: 27, mappings: [voice, other])
+        let mapper = RemoteNativeKeyMapper(mappings: [neutral], exclusiveOriginal: voice,
+            serviceProvider: { [device.service] }, defaults: store.defaults, bootSession: "boot")
+        #expect(!mapper.prepare())
+        #expect(device.writes == 0)
+        device.mappings = [other]
+        #expect(!mapper.prepare())
+        device.mappings = [neutral]
+        #expect(!mapper.prepare())
+        device.mappings = [voice]
+        #expect(mapper.prepare())
+        #expect(mapper.hasVerifiedMappings(in: [device.service]))
+        device.mappings.append(other)
+        #expect(!mapper.hasVerifiedMappings(in: [device.service]))
+        mapper.restore()
+        #expect(device.mappings.contains(voice) && device.mappings.contains(other))
+    }
+
     @Test func crashRecoveryRestoresOriginalNativeMappingsAndPreservesExternalChanges() throws {
         let store = try testDefaults()
         defer { store.cleanup() }
