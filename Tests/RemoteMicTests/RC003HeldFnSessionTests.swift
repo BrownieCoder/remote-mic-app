@@ -343,6 +343,94 @@ struct RC003HeldFnSessionTests {
         }
     }
 
+    @Test func coalescedNativeFramesWaitForTheWholeTicketAndDevicePresentation() {
+        let f = Fixture()
+        var configuration = CommandVoiceActivationAudioBuffer(maximumSampleCount: 32_000)
+        configuration.begin()
+        for _ in 0..<133 { _ = configuration.appendIfWaiting([Int16](repeating: 0, count: 240)) }
+        let batch = configuration.drain()
+        #expect(batch.count == 31_920)
+        #expect(f.begin("a"))
+        f.session.deliver(batch, enqueue: { f.pending[1] = $0.count; return true },
+                          discard: { _ in Issue.record("Accepted configuration audio discarded") })
+        f.session.stop(deliveryGeneration: 1)
+        #expect(f.begin("b"))
+        f.audio(2, 11)
+        f.session.stop(deliveryGeneration: 2)
+        f.tick(2_000)
+        #expect(f.events == ["a-down"])
+        // 1,995 ms of source plus one 512/48k output quantum is 2,005.67 ms.
+        f.pending[1] = 0
+        f.presentation[1] = 0.003
+        f.tick(6)
+        #expect(f.events == ["a-down"])
+        f.presentation[1] = nil
+        f.tick(3)
+        f.pending[2] = 0
+        f.tick(8)
+        #expect(f.events == ["a-down", "a-up", "b-down", "audio-2-11", "b-up"])
+    }
+
+    @Test func aQueuedFourSecondTicketKeepsItsOwnCallbackBudget() {
+        let f = Fixture()
+        #expect(f.begin("a"))
+        f.audio(1, 1)
+        f.session.stop(deliveryGeneration: 1)
+        #expect(f.begin("b"))
+        f.session.deliver([Int16](repeating: 0, count: 64_000),
+                          enqueue: { f.pending[2] = $0.count; return true },
+                          discard: { _ in Issue.record("Queued ticket discarded") })
+        f.session.stop(deliveryGeneration: 2)
+        f.pending[1] = 0
+        f.tick(8)
+        f.tick(2_000)
+        #expect(f.events.last == "b-down")
+        f.pending[2] = 0
+        f.tick(2_011)
+        #expect(f.events.last == "b-up")
+        #expect(!f.events.contains("playback_stalled"))
+    }
+
+    @Test func frozenTicketsTimeOutEvenIfTheEngineKeepsRendering() {
+        let cases = [(240, 4_000, 2_000), (31_920, 1, 2_745),
+                     (64_000, 1, 4_750), (131_070, 1, 8_942)]
+        for (size, count, deadlineMS) in cases {
+            let f = Fixture()
+            let packet = [Int16](repeating: 0, count: size)
+            #expect(f.begin("a"))
+            for _ in 0..<count {
+                f.session.deliver(packet, enqueue: { f.pending[1, default: 0] += $0.count; return true },
+                                  discard: { _ in Issue.record("Unexpected discard") })
+            }
+            f.session.stop(deliveryGeneration: 1)
+            var elapsed = 0
+            while elapsed + 8 < deadlineMS {
+                elapsed += 8
+                f.presentation[1] = elapsed.isMultiple(of: 16) ? 0 : 0.010667
+                f.tick(8)
+            }
+            #expect(f.events == ["a-down"])
+            f.tick(deadlineMS + 1 - elapsed)
+            #expect(f.events == ["a-down", "a-up", "playback_stalled"])
+            #expect(!f.session.isBusy)
+        }
+    }
+
+    @Test func aLargePlayedTicketDoesNotExtendTheRemainingShortTail() {
+        let f = Fixture()
+        #expect(f.begin("a"))
+        f.session.deliver([Int16](repeating: 0, count: 64_000),
+                          enqueue: { f.pending[1] = $0.count; return true }, discard: { _ in })
+        f.audio(1, 1)
+        f.session.stop(deliveryGeneration: 1)
+        f.pending[1] = 1
+        f.tick(10)
+        f.tick(749)
+        #expect(f.events.last == "audio-1-1")
+        f.tick(2)
+        #expect(f.events.suffix(2) == ["a-up", "playback_stalled"])
+    }
+
     @Test func aRapidPressAfterAStallWaitsForOutputRevocationAndKeepsItsFirstSamples() {
         let f = Fixture()
         var finishReset: (() -> Void)?

@@ -25,9 +25,16 @@ final class RC003HeldFnSession {
         var bufferedSampleCount = 0
         var deadline: TimeInterval?
         var lastPendingSamples: Int?
+        var largestBatchSamples = 0
 
         init(setKey: @escaping (Bool) -> Bool) {
             self.setKey = setKey
+        }
+
+        func enqueue(_ samples: [Int16], using output: ([Int16]) -> Bool) -> Bool {
+            guard output(samples) else { return false }
+            largestBatchSamples = max(largestBatchSamples, samples.count)
+            return true
         }
     }
 
@@ -111,7 +118,7 @@ final class RC003HeldFnSession {
             return false
         }
         if press.isHeld {
-            let accepted = enqueue(samples)
+            let accepted = press.enqueue(samples, using: enqueue)
             if !accepted { abort("audio_enqueue_failed") }
             return accepted
         }
@@ -172,7 +179,7 @@ final class RC003HeldFnSession {
         press.buffered.removeAll()
         press.bufferedSampleCount = 0
         for (index, audio) in queued.enumerated() {
-            guard audio.enqueue(audio.samples) else {
+            guard press.enqueue(audio.samples, using: audio.enqueue) else {
                 for remaining in queued.suffix(from: index + 1) {
                     remaining.discard(remaining.samples.count, "audio_enqueue_failed")
                 }
@@ -211,7 +218,13 @@ final class RC003HeldFnSession {
         } else {
             // Only a watchdog. Normal completion follows the device timeline.
             let queuedSeconds = Double(output.pendingSamples) / 16_000
-            press.deadline = uptime + min(2, queuedSeconds + 0.75)
+            // dataPlayedBack acknowledges a whole ticket. Configuration can
+            // merge native frames into one long ticket. A large backlog of
+            // tiny tickets still has the original two-second stall limit.
+            let maxFrameSamples = 2 * Int(UInt16.max) // ADPCM samples per negotiated frame
+            let ticketSeconds = Double(min(press.largestBatchSamples, maxFrameSamples)) / 16_000
+            let maxWait = max(2, ticketSeconds + 0.75)
+            press.deadline = uptime + min(maxWait, queuedSeconds + 0.75)
             press.lastPendingSamples = output.pendingSamples
         }
         let delay = output.pendingSamples == 0 ? output.presentationDelay ?? 0 : 0
