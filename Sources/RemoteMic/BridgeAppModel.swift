@@ -683,6 +683,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         },
         onAbort: { [weak self] reason in self?.disableRC003HeldFn(reason: reason) },
         onIdle: { [weak self] in
+            self?.transcriptCaptureCoordinator.managedOutputDidBecomeIdle()
             self?.restoreRC003HeldFnIfIdle()
             self?.objectWillChange.send()
         }
@@ -4015,13 +4016,14 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             AppLogger.shared.write("RC003 HELD FN phase=disabled reason=\(reason)")
         }
         let hadRoute = rc003HeldFnDevice != nil
+        if hadRoute, reason != nil { transcriptCaptureCoordinator.managedOutputWasInterrupted() }
         if let device = rc003HeldFnDevice, !disconnected,
            device == rc003HeldFnPhysicalDevice {
             // Restoring F5 while the physical button is held could create another edge.
             rc003HeldFnDiscardingDevice = device
         }
         rc003HeldFnRestorationPending = true
-        rc003HeldFnSession.cancel(notifyIdle: false)
+        rc003HeldFnSession.cancel(notifyIdle: false, reason: reason ?? "route_disabled")
         if disconnected {
             rc003HeldFnPhysicalDevice = nil
             rc003HeldFnDiscardingDevice = nil
@@ -6516,6 +6518,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             rc003VoiceExtensionAwaitingReopen &&
             rc003VoiceExtensionBridge === bridge
         let managedFn = rc003HeldFnDevice == identifier
+        let managedFnWaitingForOutput = managedFn ? rc003HeldFnSession.isBusy : nil
         var profileID = managedFn ? nil : activateRemoteProfile(for: bridge)
         if let activeBluetoothVoiceDeviceIdentifier,
            activeBluetoothVoiceDeviceIdentifier != identifier {
@@ -6579,7 +6582,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 return self.updateVoiceKeyState(streaming: true, forceSoftware: true,
                                                 owner: .bluetooth, audioDiagnostic: diagnostic)
             }) else {
-                rejectRC003HeldFnStart(bridge, identifier: identifier, reason: "held_fn_start_failed")
+                let reason = rc003HeldFnSession.rejectedPressReason ?? "held_fn_start_failed"
+                rejectRC003HeldFnStart(bridge, identifier: identifier, reason: reason)
                 return
             }
             profileID = activateRemoteProfile(for: bridge)
@@ -6690,7 +6694,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             )
         } else {
             _ = voiceFnTapSession.startVoice()
-            beginVoiceSessionIfNeeded(audioDiagnosticOperationID: bridge.audioDiagnostics?.operationID)
+            beginVoiceSessionIfNeeded(audioDiagnosticOperationID: bridge.audioDiagnostics?.operationID,
+                                      managedFnWaitingForOutput: managedFnWaitingForOutput)
             if rc003VoiceExtensionTestEnabled {
                 rc003VoiceExtensionActive = true
                 rc003VoiceExtensionAwaitingReopen = false
@@ -6792,12 +6797,17 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         }
         // Retain neutralization through the physical STOP. A programmatic close
         // could finish the stream while the person is still holding the button.
-        bridge.audioDiagnostics?.rejectStart(reason: reason)
+        bridge.audioDiagnostics?.rejectStart(reason: reason, waitForRemoteStop: reason == "press_queue_full")
     }
 
     func bluetoothBridgeDidStopVoice(_ bridge: XiaomiBluetoothBridge) {
         guard let identifier = bridge.deviceIdentifier else { return }
-        if rc003HeldFnPhysicalDevice == identifier { rc003HeldFnPhysicalDevice = nil }
+        if rc003HeldFnPhysicalDevice == identifier {
+            rc003HeldFnPhysicalDevice = nil
+            if activeBluetoothVoiceDeviceIdentifier != identifier {
+                rc003HeldFnSession.finishRejectedPress()
+            }
+        }
         if rc003HeldFnDiscardingDevice == identifier, activeBluetoothVoiceDeviceIdentifier != identifier {
             rc003HeldFnDiscardingDevice = nil
             restoreRC003HeldFnIfIdle()
@@ -6959,6 +6969,11 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             bridge.audioDiagnostics?.reject(.identifier, samples: samples.count)
             return
         }
+        if rc003HeldFnPhysicalDevice == identifier, activeBluetoothVoiceDeviceIdentifier != identifier,
+           let reason = rc003HeldFnSession.rejectedPressReason {
+            bridge.audioDiagnostics?.bufferLost(samples: samples.count, stage: "held_fn", reason: reason)
+            return
+        }
         let configurationSamplesBefore = pendingBluetoothVoiceAudio.bufferedSampleCount
         if identifier == pendingBluetoothVoiceStartIdentifier,
            pendingBluetoothVoiceAudio.appendIfWaiting(samples) {
@@ -7049,8 +7064,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 self.recordVoiceAudioEnqueueOutcome(accepted: accepted, deliveryGeneration: deliveryGeneration)
                 diagnostic?.routed(samples: batch.count, enqueued: accepted)
                 return accepted
-            } discard: { count in
-                diagnostic?.bufferLost(samples: count, stage: "held_fn", reason: "interrupted")
+            } discardWithReason: { count, reason in
+                diagnostic?.bufferLost(samples: count, stage: "held_fn", reason: reason)
             }
         } else {
             enqueued = audioOutput.enqueue(
@@ -8796,7 +8811,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         voiceSessionWarningLevel = .none
     }
 
-    private func beginVoiceSessionIfNeeded(audioDiagnosticOperationID: UInt64? = nil) {
+    private func beginVoiceSessionIfNeeded(audioDiagnosticOperationID: UInt64? = nil,
+                                           managedFnWaitingForOutput: Bool? = nil) {
         guard !isStreaming else { return }
         privateFeature.startVoiceSession()
         cancelTestToneIfNeeded(
@@ -8845,7 +8861,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         } else {
             AppLogger.shared.write("RECORDING ASSET application_fallback unavailable")
         }
-        transcriptCaptureCoordinator.startSession(sessionID: sessionID, startedAt: startedAt, source: source)
+        transcriptCaptureCoordinator.startSession(sessionID: sessionID, startedAt: startedAt, source: source,
+                                                  managedFnWaitingForOutput: managedFnWaitingForOutput)
         isStreaming = true
         if let activeMobileVoiceSource, activeMobileVoiceSource != .macMicrophone {
             voiceTargetActivityMonitor.start()
@@ -8887,7 +8904,10 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             audioOutput.endSession()
         }
         privateFeature.finishVoiceSession()
-        transcriptCaptureCoordinator.finishSession(endedAt: endedAt)
+        transcriptCaptureCoordinator.finishSession(
+            endedAt: endedAt,
+            managedFnOutputPending: rc003HeldFnDevice != nil && rc003HeldFnSession.isBusy
+        )
         if sessionID != nil {
             recordingAssetCoordinator.finish(endedAt: endedAt)
         }

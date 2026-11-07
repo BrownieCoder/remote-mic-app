@@ -2343,10 +2343,10 @@ struct SettingsPageRegressionTests {
         #expect(!agentAccessSource.contains("Popover"))
 
         #expect(modelSource.contains(
-            "transcriptCaptureCoordinator.startSession(sessionID: sessionID, startedAt: startedAt, source: source)"
+            "transcriptCaptureCoordinator.startSession(sessionID: sessionID, startedAt: startedAt, source: source,"
         ))
         #expect(modelSource.contains(
-            "transcriptCaptureCoordinator.finishSession(endedAt: endedAt)"
+            "managedFnOutputPending: rc003HeldFnDevice != nil && rc003HeldFnSession.isBusy"
         ))
         #expect(modelSource.contains("RECORDING ASSET playback_failed"))
         #expect(modelSource.contains("record_id=\\(asset.id.uuidString)"))

@@ -253,6 +253,104 @@ struct TranscriptCaptureCoordinatorTests {
         #expect(harness.logs.contains { $0.contains("saved reason=next_session_snapshot") })
     }
 
+    @Test func managedRapidRepressCannotFileALateFirstResultUnderTheSecondOrThirdPress() {
+        let h = CaptureHarness()
+        h.snapshot = CaptureHarness.safeSnapshot(text: "", selection: NSRange(location: 0, length: 0))
+        let a = UUID(), b = UUID(), c = UUID()
+        h.coordinator.startSession(sessionID: a, startedAt: Date(), source: .bluetoothRemote,
+                                   managedFnWaitingForOutput: false)
+        h.coordinator.finishSession(endedAt: Date())
+        h.scheduler.advance(by: 0.182)
+        let readsBeforeOverlap = h.snapshotReads
+        h.coordinator.startSession(sessionID: b, startedAt: Date(), source: .bluetoothRemote,
+                                   managedFnWaitingForOutput: false)
+        h.scheduler.advance(by: 0.380)
+        h.snapshot = CaptureHarness.safeSnapshot(text: "A", selection: NSRange(location: 1, length: 0))
+        h.scheduler.advance(by: 4.638)
+        h.coordinator.finishSession(endedAt: Date(), managedFnOutputPending: true)
+        h.scheduler.advance(by: 10)
+        h.coordinator.managedOutputDidBecomeIdle()
+        h.scheduler.advance(by: 1)
+        h.coordinator.startSession(sessionID: c, startedAt: Date(), source: .bluetoothRemote,
+                                   managedFnWaitingForOutput: false)
+        h.snapshot = CaptureHarness.safeSnapshot(text: "AB", selection: NSRange(location: 2, length: 0))
+        h.coordinator.finishSession(endedAt: Date())
+        h.scheduler.advance(by: 9)
+        #expect(h.captures.isEmpty)
+        #expect(h.snapshotReads == readsBeforeOverlap)
+        #expect(h.logs.filter { $0.contains("skipped reason=managed_fn_overlapping_results") }.count == 2)
+
+        let d = UUID()
+        h.coordinator.startSession(sessionID: d, startedAt: Date(), source: .bluetoothRemote,
+                                   managedFnWaitingForOutput: false)
+        h.snapshot = CaptureHarness.safeSnapshot(text: "ABD", selection: NSRange(location: 3, length: 0))
+        h.coordinator.finishSession(endedAt: Date())
+        h.scheduler.advance(by: 1.5)
+        #expect(h.captures.map(\.sessionID) == [d])
+        #expect(h.captures.map(\.text) == ["D"])
+    }
+
+    @Test func managedHistoryWaitsForPlaybackThenPreservesTwoSeparatedResults() {
+        let h = CaptureHarness()
+        h.snapshot = CaptureHarness.safeSnapshot(text: "", selection: NSRange(location: 0, length: 0))
+        let a = UUID(), b = UUID()
+        h.coordinator.startSession(sessionID: a, startedAt: Date(), source: .bluetoothRemote,
+                                   managedFnWaitingForOutput: false)
+        let stoppedAt = Date()
+        h.coordinator.finishSession(endedAt: stoppedAt, managedFnOutputPending: true)
+        h.scheduler.advance(by: 10)
+        #expect(h.snapshotReads == 1)
+        h.coordinator.managedOutputDidBecomeIdle()
+        h.snapshot = CaptureHarness.safeSnapshot(text: "A", selection: NSRange(location: 1, length: 0))
+        h.scheduler.advance(by: 2)
+        #expect(h.captures.first?.endedAt == stoppedAt)
+        h.coordinator.startSession(sessionID: b, startedAt: Date(), source: .bluetoothRemote,
+                                   managedFnWaitingForOutput: false)
+        h.snapshot = CaptureHarness.safeSnapshot(text: "AB", selection: NSRange(location: 2, length: 0))
+        h.coordinator.finishSession(endedAt: Date())
+        h.scheduler.advance(by: 2)
+        #expect(h.captures.map(\.sessionID) == [a, b])
+        #expect(h.captures.map(\.text) == ["A", "B"])
+    }
+
+    @Test func queuedOrInterruptedManagedHistorySkipsAndDisabledHistoryNeverReads() {
+        let enabled = CaptureHarness()
+        enabled.coordinator.startSession(startedAt: Date(), source: .bluetoothRemote, managedFnWaitingForOutput: true)
+        enabled.coordinator.finishSession(endedAt: Date())
+        #expect(enabled.snapshotReads == 0)
+        enabled.scheduler.advance(by: 9)
+        enabled.snapshot = CaptureHarness.safeSnapshot(text: "", selection: NSRange(location: 0, length: 0))
+        enabled.coordinator.startSession(startedAt: Date(), source: .bluetoothRemote, managedFnWaitingForOutput: false)
+        enabled.coordinator.finishSession(endedAt: Date(), managedFnOutputPending: true)
+        enabled.coordinator.managedOutputWasInterrupted()
+        enabled.snapshot = CaptureHarness.safeSnapshot(text: "A", selection: NSRange(location: 1, length: 0))
+        enabled.coordinator.managedOutputDidBecomeIdle()
+        enabled.scheduler.advance(by: 9)
+        #expect(enabled.captures.isEmpty)
+        #expect(enabled.snapshotReads == 1)
+
+        let disabled = CaptureHarness(enabled: false)
+        for previousOutput in [false, true] {
+            disabled.coordinator.startSession(startedAt: Date(), source: .bluetoothRemote,
+                                              managedFnWaitingForOutput: previousOutput)
+            disabled.coordinator.finishSession(endedAt: Date(), managedFnOutputPending: true)
+            disabled.coordinator.managedOutputDidBecomeIdle()
+            disabled.scheduler.advance(by: 9)
+        }
+        #expect(disabled.snapshotReads == 0)
+        #expect(disabled.captures.isEmpty)
+
+        enabled.coordinator.startSession(startedAt: Date(), source: .bluetoothRemote, managedFnWaitingForOutput: false)
+        enabled.snapshot = CaptureHarness.safeSnapshot(text: "AB", selection: NSRange(location: 2, length: 0))
+        enabled.coordinator.finishSession(endedAt: Date())
+        let readsBeforeDisabling = enabled.snapshotReads
+        enabled.enabled = false
+        enabled.coordinator.startSession(startedAt: Date(), source: .bluetoothRemote, managedFnWaitingForOutput: false)
+        enabled.scheduler.advance(by: 9)
+        #expect(enabled.snapshotReads == readsBeforeDisabling)
+        #expect(enabled.captures.isEmpty)
+    }
+
     @Test func unavailableInitialFocusEndsWithADiagnosticReason() {
         let harness = CaptureHarness(initialSnapshotTimeout: 0.5)
         harness.snapshot = nil
@@ -268,6 +366,7 @@ private final class CaptureHarness {
     var enabled: Bool
     var snapshot: TranscriptCaptureSnapshot?
     var captures: [CapturedTranscript] = []
+    var snapshotReads = 0
     var logs: [String] = []
     let scheduler = TranscriptManualScheduler()
     let initialSnapshotTimeout: TimeInterval
@@ -277,7 +376,7 @@ private final class CaptureHarness {
         isEnabled: { [unowned self] in enabled },
         schedule: scheduler.schedule,
         clock: { [unowned self] in scheduler.currentTime },
-        snapshot: { [unowned self] in snapshot },
+        snapshot: { [unowned self] in snapshotReads += 1; return snapshot },
         onCapture: { [unowned self] capture in captures.append(capture) },
         log: { [unowned self] message in logs.append(message) }
     )

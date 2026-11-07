@@ -176,6 +176,173 @@ struct RC003HeldFnSessionTests {
         #expect(f.events == ["a-down", "a-up"])
     }
 
+    @Test func progressingThreeSecondTailPreservesTheWholeFollowingPress() {
+        let f = Fixture()
+        #expect(f.begin("a"))
+        var deliveredA = 0
+        f.session.deliver([Int16](repeating: 1, count: 48_000), enqueue: {
+            deliveredA += $0.count
+            f.pending[1] = $0.count
+            return true
+        }, discard: { _ in Issue.record("A was discarded") })
+        f.session.stop(deliveryGeneration: 1)
+        #expect(f.begin("b"))
+        var deliveredB: [Int16] = []
+        for packet in 1...201 {
+            f.session.deliver([Int16](repeating: Int16(packet), count: 160), enqueue: {
+                deliveredB.append(contentsOf: $0)
+                f.pending[2, default: 0] += $0.count
+                return true
+            }, discard: { _ in Issue.record("B was discarded") })
+            f.pending[1, default: 0] -= 160
+            f.tick(10)
+        }
+        f.session.stop(deliveryGeneration: 2)
+        #expect(f.pending[1] == 15_840)
+        #expect(f.events == ["a-down"])
+        #expect(deliveredB.isEmpty)
+        f.pending[1] = 0
+        f.presentation[1] = 0.004
+        f.tick(990)
+        #expect(f.events == ["a-down"])
+        f.presentation[1] = nil
+        f.tick(4)
+        #expect(deliveredA == 48_000)
+        let expectedB = (1...201).flatMap { [Int16](repeating: Int16($0), count: 160) }
+        let completeInOrder = deliveredB == expectedB
+        #expect(completeInOrder)
+        f.pending[2] = 0
+        f.tick(8)
+        #expect(f.events == ["a-down", "a-up", "b-down", "b-up"])
+    }
+
+    @Test func exceedingEitherPrerollBudgetDiscardsOnlyTheNewestPhysicalPress() {
+        for batchLimited in [false, true] {
+            let f = Fixture()
+            #expect(f.begin("a"))
+            f.audio(1, 11)
+            f.session.stop(deliveryGeneration: 1)
+            #expect(f.begin("b"))
+            let batchCount = batchLimited ? RC003HeldFnSession.maximumBufferedBatches : 1
+            let batchSize = batchLimited ? 1 : RC003HeldFnSession.maximumBufferedSamples
+            let packet = [Int16](repeating: 2, count: batchSize)
+            var discarded = 0
+            let keepOutOfPlayer: ([Int16]) -> Bool = { _ in Issue.record("Rejected B reached output"); return false }
+            let account: (Int) -> Void = { discarded += $0 }
+            for _ in 0..<batchCount {
+                #expect(f.session.deliver(packet, enqueue: keepOutOfPlayer, discard: account))
+            }
+            #expect(!f.session.deliver([3], enqueue: keepOutOfPlayer, discard: account))
+            #expect(f.session.rejectedPressReason == "preroll_full")
+            #expect(discarded == batchSize * batchCount + 1)
+            #expect(f.events == ["a-down", "audio-1-11"])
+            f.pending[1] = 0
+            f.presentation[1] = 0.004
+            f.tick(10)
+            #expect(f.events.last == "audio-1-11")
+            f.presentation[1] = nil
+            f.tick(4)
+            #expect(f.events.last == "a-up")
+            #expect(!f.session.deliver([4, 5], enqueue: keepOutOfPlayer, discard: account))
+            #expect(discarded == batchSize * batchCount + 3)
+            #expect(f.session.isBusy)
+            #expect(!f.begin("overlapping"))
+            f.session.stop(deliveryGeneration: 2)
+            #expect(!f.session.isBusy)
+            #expect(f.begin("c"))
+            f.audio(3, 31)
+            f.pending[3] = 0
+            f.session.stop(deliveryGeneration: 3)
+            #expect(f.events == ["a-down", "audio-1-11", "a-up", "c-down", "audio-3-31", "c-up"])
+        }
+    }
+
+    @Test func oneMinuteOfNativeFramesFitsTheBoundedPrerollInOrder() {
+        let f = Fixture()
+        #expect(f.begin("a"))
+        f.pending[1] = 960_000
+        f.session.stop(deliveryGeneration: 1)
+        #expect(f.begin("b"))
+        var nextPacket = 0
+        var inOrder = true
+        for packet in 0..<4_000 {
+            let data = [Int16](repeating: Int16(packet), count: 240)
+            f.session.deliver(data, enqueue: { samples in
+                inOrder = inOrder && samples.count == 240 && samples.allSatisfy { $0 == Int16(nextPacket) }
+                nextPacket += 1
+                f.pending[2, default: 0] += samples.count
+                return true
+            }, discard: { _ in Issue.record("Native minute did not fit") })
+            f.pending[1, default: 0] -= 240
+            f.tick(15)
+        }
+        #expect(inOrder && nextPacket == 4_000)
+        #expect(f.pending[2] == 960_000)
+        f.pending[2] = 0
+        f.session.stop(deliveryGeneration: 2)
+        #expect(f.events == ["a-down", "a-up", "b-down", "b-up"])
+    }
+
+    @Test func routeFailureAccountsForOlderBufferedAudioIndependentlyOfNewInputOverflow() {
+        let f = Fixture()
+        #expect(f.begin("a"))
+        f.audio(1, 11)
+        f.session.stop(deliveryGeneration: 1)
+        var losses: [String: Int] = [:]
+        #expect(f.begin("b"))
+        f.session.deliver([21, 22], enqueue: { _ in true }, discardWithReason: { losses[$1, default: 0] += $0 })
+        f.session.stop(deliveryGeneration: 2)
+        #expect(f.begin("c"))
+        let excessive = [Int16](repeating: 3, count: RC003HeldFnSession.maximumBufferedSamples)
+        f.session.deliver(excessive, enqueue: { _ in true }, discardWithReason: { losses[$1, default: 0] += $0 })
+        f.interrupted.insert(1)
+        f.tick(8)
+        #expect(losses == ["preroll_full": excessive.count, "playback_interrupted": 2])
+        #expect(f.events == ["a-down", "audio-1-11", "a-up", "playback_interrupted"])
+        #expect(!f.session.isBusy)
+    }
+
+    @Test func ninthPressCannotCancelAnyOfTheEightAcceptedPresses() {
+        let f = Fixture()
+        for id in 1...8 {
+            #expect(f.begin("p\(id)"))
+            f.audio(id, Int16(id))
+            f.session.stop(deliveryGeneration: id)
+        }
+        #expect(!f.begin("rejected"))
+        #expect(f.session.rejectedPressReason == "press_queue_full")
+        f.audio(9, 9)
+        f.session.stop(deliveryGeneration: 9)
+        for id in 1...8 {
+            f.pending[id] = 0
+            f.tick(8)
+        }
+        let expected = (1...8).flatMap { ["p\($0)-down", "audio-\($0)-\($0)", "p\($0)-up"] }
+        #expect(f.events.filter { $0 != "discard-9" } == expected)
+        #expect(f.events.filter { $0 == "discard-9" }.count == 1)
+        #expect(!f.session.isBusy)
+    }
+
+    @Test func cancelOrStallWhileNewestPressIsRejectedStillResetsTheQueue() {
+        for stall in [false, true] {
+            let f = Fixture()
+            #expect(f.begin("a"))
+            f.audio(1, 10)
+            f.session.stop(deliveryGeneration: 1)
+            #expect(f.begin("b"))
+            let oversized = [Int16](repeating: 0, count: RC003HeldFnSession.maximumBufferedSamples + 1)
+            #expect(!f.session.deliver(oversized, enqueue: { _ in false }, discard: { _ in }))
+            if stall { f.tick(2_100) } else { f.session.cancel() }
+            #expect(!f.session.isBusy)
+            #expect(f.session.rejectedPressReason == nil)
+            #expect(f.events.filter { $0 == "a-up" }.count == 1)
+            #expect(f.events.contains("playback_stalled") == stall)
+            #expect(f.begin("c"))
+            f.tick(8)
+            #expect(f.events.last == "c-down")
+        }
+    }
+
     @Test func aRapidPressAfterAStallWaitsForOutputRevocationAndKeepsItsFirstSamples() {
         let f = Fixture()
         var finishReset: (() -> Void)?

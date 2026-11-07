@@ -74,6 +74,28 @@ struct ATVVAudioDiagnosticsTests {
         #expect(final.contains("drop_after_stop=1"))
     }
 
+    @Test func rejectedManagedPressCountsAllDiscardedSamplesThroughStop() throws {
+        for reason in ["preroll_full", "press_queue_full"] {
+            let clock = Clock()
+            let diagnostic = clock.make()
+            diagnostic.start(frameSamples: 240, origin: "remote_initiated")
+            if reason == "press_queue_full" { diagnostic.rejectStart(reason: reason, waitForRemoteStop: true) }
+            for _ in 0..<3 {
+                diagnostic.decoded(bytes: 120, samples: 240)
+                diagnostic.bufferLost(samples: 240, stage: "held_fn", reason: reason)
+                clock.advance(0.5)
+            }
+            #expect(clock.finals.isEmpty)
+            diagnostic.stop(reason: "remote_stop")
+            clock.advance(0.4)
+            let final = try #require(clock.finals.first)
+            #expect(final.contains("completion=forced observed_result=local_delivery_failed"))
+            #expect(final.contains("dropped_samples=720"))
+            #expect(final.contains("buffer_held_fn_\(reason)_samples=720"))
+            #expect(final.contains("last_buffer_loss_reason=\(reason)"))
+        }
+    }
+
     @Test func outputPendingIsObservedWithoutFlushingOrReportingSuccessEarly() throws {
         let clock = Clock()
         let diagnostic = clock.make()

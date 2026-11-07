@@ -402,9 +402,9 @@ final class ATVVAudioDiagnostics {
             "interval_basis=main_callback_processing")
     }
 
-    func rejectStart(reason: String) {
+    func rejectStart(reason: String, waitForRemoteStop: Bool = false) {
         if startRejectionReason == "none" { startRejectionReason = reason }
-        stop(reason: "start_rejected")
+        if !waitForRemoteStop { stop(reason: "start_rejected") }
     }
 
     func stop(reason: String) {
@@ -498,6 +498,11 @@ final class ATVVAudioDiagnostics {
         fields.append("software_down_to_first_pcm_ms=\(interval(softwareDownAt, firstPCMAt)) software_up_to_last_playback_ms=\(interval(softwareUpAt, observed?.lastPlayedAt))")
         fields.append("silence_episodes=\(silenceEpisodes) receive_stalled_at_stop=\(silenceActive) max_silence_ms=\(maxSilenceMilliseconds) observation_max_lag_ms=\(maxObservationLagMilliseconds)")
         fields.append("last_buffer_loss_reason=\(lastBufferLossReason) last_buffer_loss_cause=\(lastBufferLossCause)")
+        for reason in ["preroll_full", "press_queue_full"] {
+            if let lost = bufferLosses["held_fn_\(reason)"] {
+                fields.append("buffer_held_fn_\(reason)_samples=\(lost)")
+            }
+        }
         fields.append("fn_source=global_unattributed trigger_down_to_first_pcm_ms=unknown")
         fields.append("transcript_commit=unknown external_capture=unknown")
         fields.append("diagnostic_boundary=transport_and_external_tool_unobservable")
