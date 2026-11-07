@@ -371,6 +371,9 @@
 "connection.status.voice_active" = "Microphone in use";
 "common.status.ready" = "Ready";
 "connection.status.voice_trigger" = "Voice trigger";
+"connection.rc003_held_fn.title" = "Hold Fn until voice playback finishes";
+"connection.rc003_held_fn.detail" = "For this remote connection. Requires Input Monitoring and Accessibility.";
+"connection.rc003_held_fn.unavailable" = "Unavailable. Check that only this Xiaomi remote is connected and both permissions are granted.";
 "connection.voice_fn_tap.enabled" = "Use Fn Taps for Voice Typing";
 "connection.voice_fn_tap.hint" = "For apps that use one key press to start voice typing and another to stop, such as Typeless or Doubao Hands-Free mode. SayAll sends an Fn tap at the start and end of each session. Leave this off for apps that require you to hold the key, such as Doubao Hold mode. Requires Accessibility permission.";
 "connection.voice_fn_tap.hint_short" = "Use with hold-to-talk remotes when your voice typing app requires a press to start and another to stop.";

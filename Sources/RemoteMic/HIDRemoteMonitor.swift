@@ -1854,7 +1854,7 @@ final class HIDRemoteMonitor {
         AppLogger.shared.write("HID RELEASED permission_revoked")
     }
 
-    static func fingerprint(for device: IOHIDDevice) -> String? {
+    static func physicalFingerprint(for device: IOHIDDevice) -> String? {
         let keys = ["PhysicalDeviceUniqueID", kIOHIDSerialNumberKey, "DeviceAddress"]
         for key in keys {
             guard let value = IOHIDDeviceGetProperty(device, key as CFString) as? String,
@@ -1862,6 +1862,11 @@ final class HIDRemoteMonitor {
             else { continue }
             return SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
         }
+        return nil
+    }
+
+    static func fingerprint(for device: IOHIDDevice) -> String? {
+        if let physical = physicalFingerprint(for: device) { return physical }
         guard let location = IOHIDDeviceGetProperty(device, kIOHIDLocationIDKey as CFString) as? NSNumber else {
             return nil
         }

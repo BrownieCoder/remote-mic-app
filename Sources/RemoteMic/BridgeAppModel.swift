@@ -659,6 +659,33 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     })
     private let webRemoteClient = WebRemoteRelayClient()
     private let voiceFunctionMapper = RemoteVoiceFunctionMapper()
+    // The opt-in belongs to the connected device for this run only. The mapper's
+    // boot-scoped journal restores just its F5 if the app was interrupted.
+    @Published private(set) var rc003HeldFnProfileID: UUID?
+    @Published private(set) var rc003HeldFnUnavailable = false
+    private var rc003HeldFnDevice: UUID?
+    private var rc003HeldFnPhysicalDevice: UUID?
+    private var rc003HeldFnDeviceRegistryID: UInt64?
+    private var rc003HeldFnDiscardingDevice: UUID?
+    private var rc003HeldFnTargetsCache: [RemoteVoiceMappingService] = []
+    private let rc003HIDTopology = RC003HIDTopologyMonitor()
+    private let rc003HeldFnMapper = RemoteNativeKeyMapper(
+        family: "xiaomi_rc003_voice", mappings: [RemoteVoiceFunctionMappingPolicy.neutralRemoteVoiceKey],
+        recoveryKey: "sayall.rc003-held-fn-recovery.v1"
+    )
+    private lazy var rc003HeldFnSession = RC003HeldFnSession(
+        playback: { [weak self] generation in
+            guard let self else { return .init(pendingSamples: 0, interrupted: true) }
+            let snapshot = self.audioOutput.diagnosticSnapshot(deliveryGeneration: generation)
+            return .init(pendingSamples: snapshot.pendingSamples, interrupted: snapshot.counters.interruptedSamples > 0)
+        },
+        onAbort: { [weak self] reason in self?.disableRC003HeldFn(reason: reason) },
+        onIdle: { [weak self] in self?.objectWillChange.send() }
+    )
+
+    var canChangeRC003HeldFn: Bool {
+        !isStreaming && !rc003HeldFnSession.isBusy && rc003HeldFnDiscardingDevice == nil
+    }
     private let remoteNativeKeyMapper = RemoteNativeKeyMapper()
     private let siriNativeKeyMapper = RemoteNativeKeyMapper(
         family: "siri_remote", mappings: [], recoveryKey: "sayall.native-key-mapping-recovery.siri.v1",
@@ -1023,7 +1050,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             let data = try JSONSerialization.data(withJSONObject: configuration)
             let voice = try self.settings.voiceKeyConfigurationState(in: data)
             if voice != self.settings.voiceKeyConfigurationState {
-                guard !self.isStreaming, self.releaseVoiceKeyIfNeeded() else { throw AppConfigurationError.unsafeVoiceKeyChange }
+                guard self.canChangeRC003HeldFn, self.releaseVoiceKeyIfNeeded() else { throw AppConfigurationError.unsafeVoiceKeyChange }
             }
         }
         self.diagnosticLogUploader.setPrivateEventProvider(membershipFeature)
@@ -1542,6 +1569,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         finishRC003VoiceExtensionTest(reason: "app_stop")
         voiceInputDestinationCoordinator.shutdown()
         voiceFnTapSession.shutdown()
+        disableRC003HeldFn(disconnected: true)
         bluetoothBridges.values.forEach { $0.stop() }
         discoveryBluetoothBridge?.stop()
 #if SAYALL_SIRI_REMOTE_ENABLED
@@ -1999,7 +2027,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             started: started,
             customMappingEnabled: settings.customMappingEnabled,
             voiceKeyMode: settings.voiceKeyMode,
-            voiceFnTapModeEnabled: settings.voiceFnTapModeEnabled,
+            voiceFnTapModeEnabled: settings.voiceFnTapModeEnabled || rc003HeldFnProfileID != nil,
             softwareVoiceKeyHeld: voiceKeyLatch.isHeld,
             previous: appliedHIDPermissionSnapshot,
             current: current
@@ -2866,7 +2894,12 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 "test_tone=\(isPlayingTestTone) audio_ready=\(isAudioOutputReady)"
         )
         guard started, changed else { return }
-        if event.isSuspending { macMicrophoneSession.stop(failure: .interrupted) }
+        if event.isSuspending {
+            macMicrophoneSession.stop(failure: .interrupted)
+            if rc003HeldFnProfileID != nil {
+                disableRC003HeldFn(reason: "system_suspend")
+            }
+        }
         setBluetoothSystemSuspended(
             systemAudioSuspensionState.isSuspended,
             reason: event.rawValue
@@ -3303,6 +3336,14 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         }
         let permissionSnapshot = HIDPermissionSnapshot.current
         appliedHIDPermissionSnapshot = permissionSnapshot
+        if rc003HeldFnProfileID != nil,
+           !rc003HeldFnIsVerified(permissions: permissionSnapshot) {
+            disableRC003HeldFn(reason: "route_or_permission_changed")
+        }
+        if rc003HeldFnDiscardingDevice != nil { return }
+        if rc003HeldFnProfileID == nil {
+            rc003HeldFnMapper.restore()
+        }
         if !settings.customMappingEnabled || !permissionSnapshot.accessibilityGranted ||
             !permissionSnapshot.inputMonitoringGranted {
             remoteNativeKeyMapper.restore()
@@ -3434,7 +3475,11 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 settings.voiceFnTapModeEnabled = false
             }
             voiceFnTapSession.setEnabled(false)
-            powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: false)
+            if rc003HeldFnProfileID != nil {
+                powerKeySuppressed = !settings.customMappingEnabled || remoteNativeKeyMapper.prepare()
+            } else {
+                powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: false)
+            }
         }
         startHIDMonitors(powerKeySuppressed: powerKeySuppressed)
 #if SAYALL_SIRI_REMOTE_ENABLED
@@ -3884,7 +3929,90 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         applyHIDSettings()
     }
 
+    func setRC003HeldFnEnabled(_ enabled: Bool) {
+        guard canChangeRC003HeldFn else { return }
+        rc003HeldFnUnavailable = false
+        guard enabled else {
+            disableRC003HeldFn()
+            return
+        }
+        guard let profile = settings.selectedRemoteProfile,
+              let device = profile.bluetoothIdentifier,
+              let binding = rc003HeldFnBinding(profile: profile, permissions: .current),
+              binding.services.allSatisfy({ target in
+                  target.readMappings().filter { $0.source == RemoteVoiceFunctionMappingPolicy.remoteVoiceKey.source }
+                    == [RemoteVoiceFunctionMappingPolicy.remoteVoiceKey]
+              }),
+              rc003HIDTopology.start(serviceIDs: binding.observedIDs, onChange: { [weak self] in
+                  guard let self, self.rc003HeldFnProfileID != nil else { return }
+                  if !self.rc003HeldFnIsVerified(permissions: .current) {
+                      self.disableRC003HeldFn(reason: "hid_topology_changed")
+                  }
+              }), rc003HeldFnMapper.prepare(scopedTargets: binding.services) else {
+            disableRC003HeldFn(reason: "scope_mapping_or_permission_unavailable")
+            return
+        }
+        rc003HeldFnTargetsCache = binding.services
+        rc003HeldFnDeviceRegistryID = binding.deviceID
+        rc003HeldFnDevice = device
+        rc003HeldFnProfileID = profile.id
+        AppLogger.shared.write("RC003 HELD FN phase=armed result=verified services=\(binding.services.count)")
+    }
+
+    private func rc003HeldFnBinding(
+        profile: RemoteDeviceProfile,
+        permissions: HIDPermissionSnapshot
+    ) -> RC003VoiceHIDScope.Binding? {
+        guard permissions.accessibilityGranted, permissions.inputMonitoringGranted,
+              !rc003VoiceExtensionTestEnabled, !settings.voiceFnTapModeEnabled,
+              settings.voiceKeyMode == .function,
+              RC003VoiceHIDScope.isUnambiguousProfile(profile, among: settings.remoteDeviceProfiles),
+              !systemAudioSuspensionState.isSuspended,
+              let fingerprint = profile.hidFingerprint, !fingerprint.isEmpty,
+              readyBluetoothBridgeCount == 1, let identifier = profile.bluetoothIdentifier,
+              let bridge = bluetoothBridges[identifier],
+              case .ready = bluetoothBridgeStates[ObjectIdentifier(bridge)] else { return nil }
+        return RC003VoiceHIDScope.binding(for: fingerprint)
+    }
+
+    private func rc003HeldFnIsVerified(permissions: HIDPermissionSnapshot) -> Bool {
+        guard let profile = settings.remoteDeviceProfiles.first(where: { $0.id == rc003HeldFnProfileID }),
+              profile.bluetoothIdentifier == rc003HeldFnDevice,
+              let binding = rc003HeldFnBinding(profile: profile, permissions: permissions) else { return false }
+        let targets = binding.services
+        // A replaced or newly added interface requires a new user activation.
+        guard binding.deviceID == rc003HeldFnDeviceRegistryID,
+              Set(targets.compactMap(\.registryID)) == Set(rc003HeldFnTargetsCache.compactMap(\.registryID)),
+              rc003HeldFnMapper.hasVerifiedMappings(in: targets) else { return false }
+        rc003HeldFnTargetsCache = targets
+        return true
+    }
+
+    private func disableRC003HeldFn(reason: String? = nil, disconnected: Bool = false) {
+        if let reason {
+            rc003HeldFnUnavailable = true
+            AppLogger.shared.write("RC003 HELD FN phase=disabled reason=\(reason)")
+        }
+        if let device = rc003HeldFnDevice, !disconnected,
+           device == rc003HeldFnPhysicalDevice {
+            // Restoring F5 while the physical button is held could create another edge.
+            rc003HeldFnDiscardingDevice = device
+        }
+        if disconnected {
+            rc003HeldFnPhysicalDevice = nil
+            rc003HeldFnDiscardingDevice = nil
+        }
+        rc003HIDTopology.stop()
+        rc003HeldFnTargetsCache.removeAll()
+        rc003HeldFnDeviceRegistryID = nil
+        rc003HeldFnSession.cancel()
+        rc003HeldFnDevice = nil
+        rc003HeldFnProfileID = nil
+        if rc003HeldFnDiscardingDevice == nil { rc003HeldFnMapper.restore() }
+    }
+
     func setVoiceFnTapModeEnabled(_ enabled: Bool) {
+        guard !rc003HeldFnSession.isBusy else { return }
         guard settings.voiceKeyMode == .function else {
             settings.voiceFnTapModeEnabled = false
             return
@@ -3902,7 +4030,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     func restoreCompleteConfiguration(_ backup: MacConfigurationBackup) throws {
         let host = try settings.validatedCompleteConfigurationSnapshot(backup.host)
         try macroFeature.validateConfigurationArchive(backup.components)
-        guard !isStreaming, releaseVoiceKeyIfNeeded() else { throw AppConfigurationError.unsafeVoiceKeyChange }
+        guard canChangeRC003HeldFn, releaseVoiceKeyIfNeeded() else { throw AppConfigurationError.unsafeVoiceKeyChange }
         if try !macroFeature.restoreConfigurationArchive(backup.components, hostAfter: host) {
             let before = try settings.portableLocalSnapshot()
             do { try settings.applyPortableLocalSnapshot(host) }
@@ -3922,7 +4050,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             changedVoiceKeyConfiguration = try Self.importConfiguration(
                 from: data,
                 into: settings,
-                isStreaming: isStreaming,
+                isStreaming: !canChangeRC003HeldFn,
                 releaseVoiceKey: { releaseVoiceKeyIfNeeded() }
             )
         } catch AppConfigurationError.unsafeVoiceKeyChange {
@@ -3944,7 +4072,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         AppLogger.shared.write(
             "VOICE KEY mode_change requested from=\(previousMode) to=\(mode.rawValue)"
         )
-        guard !isStreaming else {
+        guard !isStreaming, !rc003HeldFnSession.isBusy else {
             AppLogger.shared.write(
                 "VOICE KEY mode_change_rejected reason=voice_active requested=\(mode.rawValue)"
             )
@@ -6229,6 +6357,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 cancelHIDMappingRecovery(reason: "bluetooth_not_ready")
             }
             let identifier = bluetoothIdentifier(for: bridge)
+            if let identifier, identifier == rc003HeldFnDevice || identifier == rc003HeldFnDiscardingDevice {
+                disableRC003HeldFn(reason: "device_disconnected", disconnected: true)
+            }
             if let identifier {
                 let hadBattery = pendingRemoteBatteryLevels.removeValue(forKey: identifier) != nil
                 let hadPower = pendingRemotePowerStates.removeValue(forKey: identifier) != nil
@@ -6337,7 +6468,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             rc003VoiceExtensionActive &&
             rc003VoiceExtensionAwaitingReopen &&
             rc003VoiceExtensionBridge === bridge
-        let profileID = activateRemoteProfile(for: bridge)
+        let managedFn = rc003HeldFnDevice == identifier
+        var profileID = managedFn ? nil : activateRemoteProfile(for: bridge)
         if let activeBluetoothVoiceDeviceIdentifier,
            activeBluetoothVoiceDeviceIdentifier != identifier {
             _ = bridge.requestMicrophoneClose()
@@ -6379,10 +6511,41 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             )
             return
         }
+        if managedFn {
+            rc003HeldFnPhysicalDevice = identifier
+            guard !isStreaming, !voiceKeyLatch.isHeld || rc003HeldFnSession.isBusy,
+                  let profile = settings.remoteDeviceProfiles.first(where: { $0.id == rc003HeldFnProfileID }),
+                  RC003VoiceHIDScope.isUnambiguousProfile(profile, among: settings.remoteDeviceProfiles),
+                  readyBluetoothBridgeCount == 1, settings.voiceKeyMode == .function,
+                  !settings.voiceFnTapModeEnabled, !systemAudioSuspensionState.isSuspended,
+                  rc003HeldFnMapper.hasVerifiedMappings(in: rc003HeldFnTargetsCache) else {
+                disableRC003HeldFn(reason: "unverified_start")
+                rejectRC003HeldFnStart(bridge, identifier: identifier, reason: "held_fn_unavailable")
+                return
+            }
+            let diagnostic = bridge.audioDiagnostics
+            guard rc003HeldFnSession.start(setKey: { [weak self] pressed in
+                guard let self else { return false }
+                if !pressed {
+                    return self.releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: true, audioDiagnostic: diagnostic)
+                }
+                return self.updateVoiceKeyState(streaming: true, forceSoftware: true,
+                                                owner: .bluetooth, audioDiagnostic: diagnostic)
+            }) else {
+                rejectRC003HeldFnStart(bridge, identifier: identifier, reason: "held_fn_start_failed")
+                return
+            }
+            profileID = activateRemoteProfile(for: bridge)
+        }
         if outputReadyAtStart {
             guard ensureVirtualAudioOutputReady(reason: "bluetooth_voice_start") else {
-                _ = bridge.requestMicrophoneClose()
-                bridge.audioDiagnostics?.rejectStart(reason: "audio_output_unavailable")
+                if managedFn {
+                    disableRC003HeldFn(reason: "audio_output_unavailable")
+                    rejectRC003HeldFnStart(bridge, identifier: identifier, reason: "audio_output_unavailable")
+                } else {
+                    _ = bridge.requestMicrophoneClose()
+                    bridge.audioDiagnostics?.rejectStart(reason: "audio_output_unavailable")
+                }
                 AppLogger.shared.write("ATVV STREAM rejected_audio_output")
                 recordPublicDiagnosticEvent(
                     component: "voice",
@@ -6407,7 +6570,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         activeBluetoothVoiceDeviceIdentifier = identifier
         loggedBluetoothVoiceAudioDeviceIdentifier = nil
         bluetoothVoiceActive = true
-        guard updateVoiceKeyState(
+        guard managedFn || updateVoiceKeyState(
             streaming: true,
             forceSoftware: false,
             owner: .bluetooth,
@@ -6574,8 +6737,26 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         }
     }
 
+    private func rejectRC003HeldFnStart(_ bridge: XiaomiBluetoothBridge, identifier: UUID, reason: String) {
+        if pendingBluetoothVoiceStartIdentifier == identifier {
+            pendingBluetoothVoiceStartIdentifier = nil
+            cancelPendingBluetoothVoiceAudio(reason: reason)
+            pendingBluetoothVoiceStopRequested = false
+        }
+        // Retain neutralization through the physical STOP. A programmatic close
+        // could finish the stream while the person is still holding the button.
+        bridge.audioDiagnostics?.rejectStart(reason: reason)
+    }
+
     func bluetoothBridgeDidStopVoice(_ bridge: XiaomiBluetoothBridge) {
         guard let identifier = bridge.deviceIdentifier else { return }
+        if rc003HeldFnPhysicalDevice == identifier { rc003HeldFnPhysicalDevice = nil }
+        if rc003HeldFnDiscardingDevice == identifier, activeBluetoothVoiceDeviceIdentifier != identifier {
+            rc003HeldFnDiscardingDevice = nil
+            rc003HeldFnMapper.restore()
+            applyHIDSettings(restartSiriRemote: false)
+            return
+        }
         if pendingBluetoothVoiceStartIdentifier == identifier,
            activeBluetoothVoiceDeviceIdentifier == nil {
             pendingBluetoothVoiceStartIdentifier = nil
@@ -6625,7 +6806,15 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         pendingBluetoothVoiceStartIdentifier = nil
         cancelPendingBluetoothVoiceAudio(reason: "remote_stop")
         pendingBluetoothVoiceStopRequested = false
-        releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: false, audioDiagnostic: bridge.audioDiagnostics)
+        if rc003HeldFnDevice == identifier {
+            rc003HeldFnSession.stop(deliveryGeneration: voiceAudioDeliveryDiagnostic.generation)
+        } else if rc003HeldFnDiscardingDevice == identifier {
+            rc003HeldFnDiscardingDevice = nil
+            rc003HeldFnMapper.restore()
+            applyHIDSettings(restartSiriRemote: false)
+        } else {
+            releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: false, audioDiagnostic: bridge.audioDiagnostics)
+        }
         cancelPendingCommandVoiceAudio(reason: "remote_stop")
         if longRecordingRequested {
             finishLongRecording(reason: "remote_stop")
@@ -6798,9 +6987,24 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         recordingAssetCoordinator.append(samples: samples)
         let deliveryGeneration = voiceAudioDeliveryDiagnostic.generation
         let handledByFnTapMode = voiceFnTapSession.receive(samples)
+        let routesManagedAudio = rc003HeldFnDevice == identifier
         let enqueued: Bool
         if handledByFnTapMode {
             enqueued = true
+        } else if rc003HeldFnDiscardingDevice == identifier {
+            bridge.audioDiagnostics?.bufferLost(samples: samples.count, stage: "held_fn", reason: "aborted")
+            enqueued = false
+        } else if rc003HeldFnDevice == identifier {
+            let diagnostic = bridge.audioDiagnostics
+            enqueued = rc003HeldFnSession.deliver(samples) { [weak self] batch in
+                guard let self else { return false }
+                let accepted = self.audioOutput.enqueue(samples: batch, deliveryGeneration: deliveryGeneration)
+                self.recordVoiceAudioEnqueueOutcome(accepted: accepted, deliveryGeneration: deliveryGeneration)
+                diagnostic?.routed(samples: batch.count, enqueued: accepted)
+                return accepted
+            } discard: { count in
+                diagnostic?.bufferLost(samples: count, stage: "held_fn", reason: "interrupted")
+            }
         } else {
             enqueued = audioOutput.enqueue(
                 samples: samples,
@@ -6815,7 +7019,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             samples: samples,
             route: handledByFnTapMode ? .virtualAudioViaFnTap : .virtualAudioDirect
         )
-        bridge.audioDiagnostics?.routed(samples: samples.count, enqueued: enqueued)
+        if !routesManagedAudio {
+            bridge.audioDiagnostics?.routed(samples: samples.count, enqueued: enqueued)
+        }
         bluetoothVoiceDecodedBatchCount += 1
         bluetoothVoiceDecodedSampleCount += samples.count
         bluetoothVoiceTailDiagnostics.append(samples, at: ProcessInfo.processInfo.systemUptime)
@@ -8042,7 +8248,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     private func shouldKeepVirtualAudioActive(allowingIdleBridgeRelease: Bool) -> Bool {
         VirtualAudioConnectionLifecyclePolicy.shouldBeActive(
             readyBluetoothBridgeCount: readyBluetoothBridgeCount,
-            bluetoothVoiceActive: bluetoothVoiceActive,
+            bluetoothVoiceActive: bluetoothVoiceActive || rc003HeldFnSession.isBusy,
             mobileVoiceActive: macMicrophoneEnabled || activeMobileVoiceSource != nil ||
                 !appleRemoteVoiceDevices.isEmpty || appleRemoteVoiceStopping,
             testToneActive: isPlayingTestTone,
@@ -8052,7 +8258,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     }
 
     private var hasActiveVirtualAudioSource: Bool {
-        bluetoothVoiceActive || activeMobileVoiceSource != nil ||
+        bluetoothVoiceActive || rc003HeldFnSession.isBusy || activeMobileVoiceSource != nil ||
             !appleRemoteVoiceDevices.isEmpty || appleRemoteVoiceStopping || isPlayingTestTone
     }
 
@@ -8682,6 +8888,10 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         audioDiagnostic: ATVVAudioDiagnostics? = nil
     ) -> Bool {
         let keyDiagnostic = audioDiagnostic ?? (streaming ? nil : heldSoftwareVoiceKeyDiagnostic)
+        if streaming, owner != .bluetooth, rc003HeldFnSession.isBusy {
+            keyDiagnostic?.softwareKey(edge: "down", mode: settings.voiceKeyMode.rawValue, result: "held_fn_busy")
+            return false
+        }
         let edge = streaming ? "down" : "up"
         let mode = streaming
             ? settings.voiceKeyMode

@@ -3119,6 +3119,22 @@ struct SettingsView: View {
                     .font(.system(size: 13, weight: .semibold))
                 Divider()
                 mappingVoiceKeyModeControl
+                if settings.selectedRemoteProfile?.model == .rc003,
+                   settings.voiceKeyMode == .function, !settings.voiceFnTapModeEnabled {
+                    Divider()
+                    VStack(alignment: .leading, spacing: 2) {
+                        Toggle("connection.rc003_held_fn.title", isOn: Binding(
+                            get: { model.rc003HeldFnProfileID != nil && model.rc003HeldFnProfileID == settings.selectedRemoteProfileID },
+                            set: { model.setRC003HeldFnEnabled($0) }
+                        ))
+                        .font(.system(size: 12, weight: .medium))
+                        .toggleStyle(.switch)
+                        .disabled(!model.canChangeRC003HeldFn)
+                        Text(model.rc003HeldFnUnavailable ? "connection.rc003_held_fn.unavailable" : "connection.rc003_held_fn.detail")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 // 「语音键模拟 Fn 点按」只对「不会按一次收音」的遥控器有意义：
                 // 它把按住模拟成点按，用来驱动只认点按的工具。Chromecast 自己能按一次收音，
                 // 驱动方式由语音模式直接决定，页面不出现该开关（见能力矩阵文档）。

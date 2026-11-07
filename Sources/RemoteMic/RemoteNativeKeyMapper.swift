@@ -66,14 +66,14 @@ final class RemoteNativeKeyMapper {
 
     /// Re-enumerate for each device activation; never reuse a global readiness bit.
     @discardableResult
-    func prepare(additionalSources: [UInt64] = []) -> Bool {
+    func prepare(additionalSources: [UInt64] = [], scopedTargets: [RemoteVoiceMappingService]? = nil) -> Bool {
         isPrepared = false
         sources.formUnion(additionalSources)
         guard recoveryAvailable, bootSession != nil else {
             log("prepare", result: "failed", reason: "recovery_unavailable")
             return false
         }
-        let targets = services()
+        let targets = scopedTargets ?? services()
         guard !targets.isEmpty else {
             log("prepare", result: "pending", reason: "no_service")
             return false
@@ -131,6 +131,15 @@ final class RemoteNativeKeyMapper {
         log("prepare", result: "verified", reason: "mapping_readback",
             detail: "services=\(targets.count) native_delivery=unobserved")
         return true
+    }
+
+    /// Check the current, independently scoped services without changing a mapping mid-press.
+    func hasVerifiedMappings(in targets: [RemoteVoiceMappingService]) -> Bool {
+        guard isPrepared, !targets.isEmpty else { return false }
+        return targets.allSatisfy { target in
+            guard let id = target.registryID, originals[id] != nil else { return false }
+            return matches(nativeMappings(in: target.readMappings()), desiredMappings)
+        }
     }
 
     /// Restore owned ordinary-key mappings, retaining voice and external edits.
