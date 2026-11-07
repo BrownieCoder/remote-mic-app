@@ -19,6 +19,9 @@ final class RC003HeldFnSession {
 
     private final class Press {
         let setKey: (Bool) -> Bool
+        let targetGate: UInt64?
+        var downAllowed: Bool
+        var audioAllowed: Bool
         var isHeld = false
         var stoppedGeneration: Int?
         var buffered: [BufferedAudio] = []
@@ -27,7 +30,10 @@ final class RC003HeldFnSession {
         var lastPendingSamples: Int?
         var largestBatchSamples = 0
 
-        init(setKey: @escaping (Bool) -> Bool) {
+        init(targetGate: UInt64?, setKey: @escaping (Bool) -> Bool) {
+            self.targetGate = targetGate
+            self.downAllowed = targetGate == nil
+            self.audioAllowed = targetGate == nil
             self.setKey = setKey
         }
 
@@ -43,6 +49,8 @@ final class RC003HeldFnSession {
     private let schedule: (TimeInterval, @escaping () -> Void) -> Void
     private let onAbort: (String) -> Void
     private let onIdle: () -> Void
+    var resetGuardedOutput: ((@escaping () -> Void) -> Void)?
+    var onGuardedRejection: ((UInt64, String) -> Void)?
     private var presses: [Press] = []
     // One minute of 16 kHz mono plus margin (1.95 MiB of Int16 payload).
     // Bound the retained batch arrays and closures independently of packet size.
@@ -50,20 +58,19 @@ final class RC003HeldFnSession {
     static let maximumBufferedBatches = 8_192
     private(set) var rejectedPressReason: String?
 
-    private var outputReset: UInt64?
+    private var outputResets: Set<UInt64> = []
     private var nextReset: UInt64 = 0
 
-    var isBusy: Bool { !presses.isEmpty || outputReset != nil || rejectedPressReason != nil }
+    var isBusy: Bool { !presses.isEmpty || !outputResets.isEmpty || rejectedPressReason != nil }
 
     /// Capture a new physical press immediately, but never open a new target
     /// window while an invalidated player can still render the old generation.
     func waitForOutputReset(_ reset: (@escaping () -> Void) -> Void) {
         nextReset &+= 1
         let token = nextReset
-        outputReset = token
+        outputResets.insert(token)
         reset { [weak self] in
-            guard let self, self.outputReset == token else { return }
-            self.outputReset = nil
+            guard let self, self.outputResets.remove(token) != nil, self.outputResets.isEmpty else { return }
             self.startNextPressIfReady()
         }
     }
@@ -84,7 +91,7 @@ final class RC003HeldFnSession {
         self.onIdle = onIdle
     }
 
-    func start(setKey: @escaping (Bool) -> Bool) -> Bool {
+    func start(targetGate: UInt64? = nil, setKey: @escaping (Bool) -> Bool) -> Bool {
         guard rejectedPressReason == nil,
               presses.last == nil || presses.last?.stoppedGeneration != nil else { return false }
         // A stalled output cannot retain unlimited tiny button presses.
@@ -92,9 +99,9 @@ final class RC003HeldFnSession {
             rejectedPressReason = "press_queue_full"
             return false
         }
-        let press = Press(setKey: setKey)
+        let press = Press(targetGate: targetGate, setKey: setKey)
         presses.append(press)
-        guard presses.first === press, outputReset == nil else { return true }
+        guard presses.first === press, outputResets.isEmpty else { return true }
         return pressKey(press)
     }
 
@@ -117,7 +124,7 @@ final class RC003HeldFnSession {
             discard(samples.count, rejectedPressReason ?? "interrupted")
             return false
         }
-        if press.isHeld {
+        if press.isHeld && press.audioAllowed {
             let accepted = press.enqueue(samples, using: enqueue)
             if !accepted { abort("audio_enqueue_failed") }
             return accepted
@@ -127,9 +134,13 @@ final class RC003HeldFnSession {
         guard samples.count <= availableSamples, batchCount < Self.maximumBufferedBatches else {
             // It is the newest physical press and has never opened a target window.
             // Consume its remaining input through STOP while earlier presses drain.
-            rejectedPressReason = "preroll_full"
-            presses.removeLast()
-            press.buffered.forEach { $0.discard($0.samples.count, "preroll_full") }
+            if let target = press.targetGate {
+                rejectGuarded(target, reason: "preroll_full")
+            } else {
+                rejectedPressReason = "preroll_full"
+                presses.removeLast()
+                press.buffered.forEach { $0.discard($0.samples.count, "preroll_full") }
+            }
             discard(samples.count, "preroll_full")
             return false
         }
@@ -142,7 +153,7 @@ final class RC003HeldFnSession {
         if finishRejectedPress() { return }
         guard let press = presses.last, press.stoppedGeneration == nil else { return }
         press.stoppedGeneration = deliveryGeneration
-        if presses.first === press, press.isHeld { waitForPlayback(press) }
+        if presses.first === press, press.isHeld, press.audioAllowed { waitForPlayback(press) }
     }
 
     /// A rejected physical START does not own an audio delivery generation.
@@ -166,15 +177,70 @@ final class RC003HeldFnSession {
             }
             press.buffered.forEach { $0.discard($0.samples.count, reason) }
         }
-        if notifyIdle, outputReset == nil { onIdle() }
+        if notifyIdle, outputResets.isEmpty { onIdle() }
+    }
+
+    // A grant is consumed only at the actual head and after any real output reset.
+    func canOpenGuarded(_ token: UInt64) -> Bool {
+        guard let press = presses.first else { return false }
+        return press.targetGate == token && !press.downAllowed && !press.isHeld && outputResets.isEmpty
+    }
+
+    @discardableResult
+    func openGuarded(_ token: UInt64) -> Bool {
+        guard canOpenGuarded(token), let press = presses.first else { return false }
+        press.downAllowed = true
+        return pressKey(press)
+    }
+
+    func confirmGuardedReader(_ token: UInt64) {
+        guard let press = presses.first, press.targetGate == token,
+              press.isHeld, !press.audioAllowed else { return }
+        press.audioAllowed = true
+        _ = handOffBufferedAudio(press)
+    }
+
+    func rejectGuarded(_ token: UInt64, reason: String) {
+        guard let index = presses.firstIndex(where: { $0.targetGate == token }) else { return }
+        let press = presses[index]
+        let wasHeld = press.isHeld
+        let hasCommittedAudio = wasHeld && press.largestBatchSamples > 0
+        guard !hasCommittedAudio || resetGuardedOutput != nil else { abort(reason); return }
+        presses.remove(at: index)
+        if press.stoppedGeneration == nil { rejectedPressReason = reason }
+        press.isHeld = false
+        let withdraw = {
+            press.buffered.forEach { $0.discard($0.samples.count, reason) }
+            if wasHeld, !press.setKey(false) {
+                self.abort("fn_up_failed")
+                return
+            }
+            self.onGuardedRejection?(token, reason)
+        }
+        if hasCommittedAudio, let resetGuardedOutput {
+            // Hold subsequent keys behind this generation's actual presentation
+            // fence even if a concurrent disconnect's empty reset finishes first.
+            waitForOutputReset { done in
+                withdraw()
+                resetGuardedOutput(done)
+            }
+        } else {
+            withdraw()
+            if index == 0 && outputResets.isEmpty { startNextPressIfReady() }
+        }
     }
 
     private func pressKey(_ press: Press) -> Bool {
+        guard press.downAllowed else { return true }
         guard press.setKey(true) else {
             abort("fn_down_failed")
             return false
         }
         press.isHeld = true
+        return !press.audioAllowed || handOffBufferedAudio(press)
+    }
+
+    private func handOffBufferedAudio(_ press: Press) -> Bool {
         let queued = press.buffered
         press.buffered.removeAll()
         press.bufferedSampleCount = 0

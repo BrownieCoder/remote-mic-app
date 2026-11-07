@@ -895,6 +895,15 @@ final class VirtualAudioOutput {
     )!
 
     var selectedDevice: AudioDeviceInfo? { cachedOutputState.selectedDevice }
+
+    /// Both IDs are read back by the existing engine configuration, outside the key path.
+    var boundDoubaoDeviceID: AudioDeviceID? {
+        let state = cachedOutputState
+        guard state.ready, state.healthy, let selected = state.selectedDevice,
+              selected.uid == DoubaoAudioDevicePolicy.deviceUID,
+              let actual = state.actualDevice, actual.uid == selected.uid, actual.id == selected.id else { return nil }
+        return actual.id
+    }
     private(set) var status: LocalizedMessage {
         get { cachedOutputState.status }
         set { updateOutputState { $0.status = newValue } }

@@ -676,6 +676,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         exclusiveOriginal: RemoteVoiceFunctionMappingPolicy.remoteVoiceKey,
         recoveryKey: "sayall.rc003-held-fn-recovery.v1"
     )
+    private var doubaoAdjacentDictation: DoubaoAdjacentDictation?
+    private var doubaoRearmSettings: AnyCancellable?
     private lazy var rc003HeldFnSession = RC003HeldFnSession(
         playback: { [weak self] generation in
             guard let self else { return .init(pendingSamples: 0, interrupted: true) }
@@ -2968,6 +2970,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         reason: String,
         completion: @escaping (Bool) -> Void = { _ in }
     ) {
+        doubaoAdjacentDictation?.environmentChanged("output_reconfigure")
         cancelVirtualAudioReleaseIfPending(trigger: "rebind_\(reason)")
         virtualAudioReleaseGeneration &+= 1
         audioConfigurationGeneration &+= 1
@@ -2989,6 +2992,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                     completion(false)
                     return
                 }
+                self.doubaoAdjacentDictation?.environmentChanged("output_reconfigured")
                 self.audioStatus = self.audioOutput.status
                 self.isAudioOutputReady = self.audioOutput.isReadyForTestTone
                 self.testToneStatus = self.isAudioOutputReady
@@ -3943,13 +3947,20 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         if enabled, rc003HeldFnProfileID == settings.selectedRemoteProfileID,
            rc003HeldFnProfileID != nil, rc003HeldFnDiscardingDevice == nil {
             guard rc003HeldFnIsVerified(permissions: .current) else { return }
+            let wasPending = rc003HeldFnRestorationPending
             rc003HeldFnRestorationPending = false
             rc003HeldFnUnavailable = false
             audioOutput.setHeldFnPlaybackEnabled(true)
+            if #available(macOS 14.2, *), wasPending {
+                if doubaoRearmSettings == nil { observeDoubaoRearmSettings() } else { updateDoubaoRearm() }
+            }
             return
         }
         guard canChangeRC003HeldFn else {
-            if !enabled, rc003HeldFnProfileID != nil { rc003HeldFnRestorationPending = true }
+            if !enabled, rc003HeldFnProfileID != nil {
+                rc003HeldFnRestorationPending = true
+                doubaoAdjacentDictation?.environmentChanged("route_disabled")
+            }
             return
         }
         rc003HeldFnUnavailable = false
@@ -3978,7 +3989,41 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         rc003HeldFnDevice = device
         rc003HeldFnProfileID = profile.id
         audioOutput.setHeldFnPlaybackEnabled(true)
+        if #available(macOS 14.2, *) { observeDoubaoRearmSettings() }
         AppLogger.shared.write("RC003 HELD FN phase=armed result=verified services=\(binding.services.count)")
+    }
+
+    private func observeDoubaoRearmSettings() {
+        doubaoRearmSettings = settings.$onboardingVoiceTool.combineLatest(settings.$selectedAudioDeviceUID)
+            .dropFirst().receive(on: DispatchQueue.main).sink { [weak self] _ in self?.updateDoubaoRearm() }
+        updateDoubaoRearm()
+    }
+
+    private func updateDoubaoRearm() {
+        guard rc003HeldFnProfileID != nil, !rc003HeldFnRestorationPending,
+              settings.onboardingVoiceTool == .doubao, settings.selectedAudioDeviceUID == DoubaoAudioDevicePolicy.deviceUID else {
+            doubaoAdjacentDictation?.stop()
+            doubaoAdjacentDictation = nil
+            return
+        }
+        if let doubaoAdjacentDictation {
+            doubaoAdjacentDictation.environmentChanged("output_or_tool_changed")
+            return
+        }
+        let observer = DoubaoAdjacentDictation(session: rc003HeldFnSession) { [weak self] in
+            guard let self, !self.rc003HeldFnRestorationPending, self.settings.onboardingVoiceTool == .doubao,
+                  self.settings.selectedAudioDeviceUID == DoubaoAudioDevicePolicy.deviceUID,
+                  self.settings.voiceKeyMode == .function, !self.settings.voiceFnTapModeEnabled,
+                  let remote = self.rc003HeldFnDeviceRegistryID, let output = self.audioOutput.boundDoubaoDeviceID else { return nil }
+            return .init(remote: remote, output: output)
+        }
+        rc003HeldFnSession.resetGuardedOutput = { [weak self] completion in
+            guard let self else { completion(); return }
+            self.transcriptCaptureCoordinator.managedOutputWasInterrupted()
+            self.audioOutput.interruptHeldFnPlayback(completion: completion)
+        }
+        doubaoAdjacentDictation = observer
+        observer.start()
     }
 
     private func rc003HeldFnBinding(
@@ -4023,6 +4068,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             rc003HeldFnDiscardingDevice = device
         }
         rc003HeldFnRestorationPending = true
+        doubaoRearmSettings = nil
+        doubaoAdjacentDictation?.stop(sessionIsCancelling: true)
+        doubaoAdjacentDictation = nil
         rc003HeldFnSession.cancel(notifyIdle: false, reason: reason ?? "route_disabled")
         if disconnected {
             rc003HeldFnPhysicalDevice = nil
@@ -4050,6 +4098,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     }
 
     private func clearRC003HeldFnRoute() {
+        doubaoRearmSettings = nil
+        doubaoAdjacentDictation?.stop()
+        doubaoAdjacentDictation = nil
         rc003HeldFnRestorationPending = false
         if rc003HeldFnDevice != nil { audioOutput.setHeldFnPlaybackEnabled(false) }
         rc003HIDTopology.stop()
@@ -6574,14 +6625,18 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 return
             }
             let diagnostic = bridge.audioDiagnostics
-            guard rc003HeldFnSession.start(setKey: { [weak self] pressed in
+            let rearm = doubaoAdjacentDictation
+            let admission = rearm?.physicalStart()
+            guard rc003HeldFnSession.start(targetGate: admission?.gated == true ? admission?.id : nil,
+                                           setKey: { [weak self, weak rearm] pressed in
                 guard let self else { return false }
-                if !pressed {
-                    return self.releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: true, audioDiagnostic: diagnostic)
-                }
-                return self.updateVoiceKeyState(streaming: true, forceSoftware: true,
-                                                owner: .bluetooth, audioDiagnostic: diagnostic)
+                let sent = pressed
+                    ? self.updateVoiceKeyState(streaming: true, forceSoftware: true, owner: .bluetooth, audioDiagnostic: diagnostic)
+                    : self.releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: true, audioDiagnostic: diagnostic)
+                if sent { rearm?.key(admission, down: pressed) }
+                return sent
             }) else {
+                rearm?.unaccepted(admission)
                 let reason = rc003HeldFnSession.rejectedPressReason ?? "held_fn_start_failed"
                 rejectRC003HeldFnStart(bridge, identifier: identifier, reason: reason)
                 return
