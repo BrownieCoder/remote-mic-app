@@ -96,7 +96,7 @@ struct DoubaoRearmTests {
         #expect(r.events == ["1+", "audio-1-2", "1-"])
         r.observe(.idle, .absent)
         #expect(r.start(2)?.gated == false)
-        r.observe(.active, .unique(19)) // no fresh idle since the actual down
+        r.observe(.active, .absent) // no window has ever been witnessed
         r.audio(2); r.stop(2)
         #expect(r.start(3) == nil)
         r.presented(2)
@@ -139,15 +139,65 @@ struct DoubaoRearmTests {
         #expect(r.start(4)?.gated == false)
     }
 
-    @Test func missingPostReleaseWitnessDiscardsProtectedSpeechAndNextIndependentCanStart() {
+    @Test func fastInitialOpenIsUnattributedAndRequiresClearAndNewReaderBeforeGivingBAnyPCM() {
+        let r = Rig()
+        r.observe(.idle, .absent)
+        #expect(r.start(1)?.gated == false)
+        r.observe(.active, .unique(19))
+        #expect(r.state.sawUnattributedOccupancy)
+        r.audio(1); r.stop(1)
+        #expect(r.start(2)?.gated == true)
+        r.audio(2); r.stop(2); r.presented(1)
+        r.observe(.idle, .unique(19))
+        #expect(r.events == ["1+", "audio-1-2", "1-"])
+        r.observe(.idle, .absent)
+        #expect(r.events.last == "2+")
+        r.observe(.active, .unique(27))
+        r.presented(2)
+        #expect(r.events.suffix(3) == ["2+", "audio-2-2", "2-"])
+    }
+
+    @Test func busyStateAlreadyKnownBeforeInitialKeyDoesNotArmTheNewObservation() {
+        let r = Rig()
+        r.observe(.idle, .absent)
+        r.observe(.active, .unique(19))
+        #expect(r.start(1) == nil)
+        r.audio(1); r.stop(1); r.presented(1)
+        #expect(r.events == ["1+", "audio-1-2", "1-"])
+    }
+
+    @Test func clearAfterReleaseOfAnObservedWindowPreservesBAndCButAStraddlingReplyCannotGrant() {
         let r = Rig()
         r.verifiedA()
         _ = r.start(2); r.audio(2); r.stop(2)
-        r.presented(1)
+        _ = r.start(3); r.audio(3); r.stop(3); r.presented(1)
+        r.apply(r.state.observe(.init(begin: r.tick - 1, end: r.tick + 1, before: .idle, panel: .absent, after: .idle),
+                                epoch: r.state.epoch, canOpen: r.session.canOpenGuarded))
+        #expect(r.events.last == "1-")
         r.observe(.idle, .absent)
-        #expect(r.events.suffix(2) == ["1-", "drop-2-2-target_window_unconfirmed"])
-        #expect(r.start(3) == nil)
+        #expect(r.events.last == "2+")
+        r.observe(.active, .unique(56)); r.presented(2)
+        r.observe(.idle, .absent)
         #expect(r.events.last == "3+")
+        r.observe(.active, .unique(57)); r.presented(3)
+        #expect(r.events == ["1+", "audio-1-2", "1-", "2+", "audio-2-2", "2-", "3+", "audio-3-2", "3-"])
+    }
+
+    @Test func aWindowFirstSeenAfterBReleaseCannotOpenCOrWithholdB() {
+        let r = Rig()
+        var observed = [State.WindowObservation]()
+        r.state.onGuardedWindow = { _, event in observed.append(event) }
+        r.verifiedA()
+        _ = r.start(2); r.audio(2); r.stop(2)
+        _ = r.start(3); r.audio(3); r.stop(3); r.presented(1)
+        r.observe(.idle, .absent); r.observe(.active, .absent); r.presented(2)
+        r.observe(.active, .absent); r.observe(.idle, .unique(56))
+        #expect(r.events.last == "2-")
+        r.observe(.idle, .absent)
+        #expect(!r.events.contains("3+"))
+        #expect(r.events.contains("audio-2-2"))
+        #expect(r.events.last == "drop-3-2-target_window_unconfirmed")
+        #expect(observed == [.unseenAtUp, .afterUp])
     }
 
     @Test func changedWindowAmbiguousRouteOrReceiverWithdrawsDescendantsWithoutDuplicatingFn() {
@@ -206,6 +256,48 @@ struct DoubaoRearmTests {
             #expect(!r.events.contains("2+"))
             #expect(r.events.last?.hasPrefix("drop-2-2-target_") == true)
         }
+    }
+
+    @Test func positiveHALAndInputSourceReceiptsHaveAnExclusiveMonotonicDeadline() {
+        typealias Permit = DoubaoAdjacentDictation.ReaderPermit
+        let first = Permit(token: 2, sampleBeganAt: 1_000, sourceCheckedAt: 1_002)
+        #expect(first.expires == 1_000 + Permit.maximumAge)
+        #expect(first.allows(2, at: first.expires - 1))
+        #expect(!first.allows(2, at: first.expires))
+        #expect(!first.allows(2, at: first.expires + 1))
+        #expect(!first.allows(3, at: first.expires - 1))
+        let newerHAL = Permit(token: 2, sampleBeganAt: 90_000_000, sourceCheckedAt: 1_002)
+        #expect(newerHAL.expires == 1_002 + Permit.maximumAge)
+        let newerSource = Permit(token: 2, sampleBeganAt: 1_000, sourceCheckedAt: 90_000_000)
+        #expect(newerSource.expires == first.expires)
+    }
+
+    @Test func aLongBufferedHandoffAtTheCutoffDiscardsOnlyUnsubmittedBatchesAndResetsOnce() {
+        let r = Rig()
+        var now: UInt64 = 0
+        let permission = DoubaoAdjacentDictation.ReaderPermit(token: 2, sampleBeganAt: 0, sourceCheckedAt: 0)
+        r.session.guardedAudioIsFresh = { permission.allows($0, at: now) }
+        r.verifiedA()
+        _ = r.start(2)
+        for n: Int16 in [21, 22, 23] {
+            _ = r.session.deliver([n, 0], enqueue: { samples in
+                r.events.append("submitted-\(samples[0])")
+                now = permission.expires
+                return true
+            }, discardWithReason: { count, reason in r.events.append("lost-\(n)-\(count)-\(reason)") })
+        }
+        r.stop(2); r.presented(1); r.observe(.idle, .absent)
+        now = permission.expires - 1
+        r.observe(.active, .unique(32))
+        #expect(r.events.contains("submitted-21"))
+        #expect(!r.events.contains("submitted-22"))
+        #expect(r.events.contains("lost-22-2-target_observation_expired"))
+        #expect(r.events.contains("lost-23-2-target_observation_expired"))
+        #expect(r.events.filter { $0 == "reset-isolated" }.count == 1)
+        _ = r.start(3)
+        #expect(!r.events.contains("3+"))
+        r.reset?(); r.reset = nil
+        #expect(r.events.last == "3+")
     }
 
     @Test func timeoutWithFnAlreadyDownReleasesItOnceAndNeverDeliversUnconfirmedAudio() {

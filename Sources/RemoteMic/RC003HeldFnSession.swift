@@ -50,6 +50,9 @@ final class RC003HeldFnSession {
     private let onAbort: (String) -> Void
     private let onIdle: () -> Void
     var resetGuardedOutput: ((@escaping () -> Void) -> Void)?
+    // Only guarded deliveries consult this cheap monotonic predicate. No HAL,
+    // AX, TIS or process lookup is allowed on the PCM path.
+    var guardedAudioIsFresh: ((UInt64) -> Bool)?
     var onGuardedRejection: ((UInt64, String) -> Void)?
     private var presses: [Press] = []
     // One minute of 16 kHz mono plus margin (1.95 MiB of Int16 payload).
@@ -125,6 +128,12 @@ final class RC003HeldFnSession {
             return false
         }
         if press.isHeld && press.audioAllowed {
+            if let token = press.targetGate, guardedAudioIsFresh?(token) == false {
+                let reason = "target_observation_expired"
+                rejectGuarded(token, reason: reason)
+                discard(samples.count, reason)
+                return false
+            }
             let accepted = press.enqueue(samples, using: enqueue)
             if !accepted { abort("audio_enqueue_failed") }
             return accepted
@@ -245,6 +254,14 @@ final class RC003HeldFnSession {
         press.buffered.removeAll()
         press.bufferedSampleCount = 0
         for (index, audio) in queued.enumerated() {
+            // A long preroll handoff can span the deadline on the main queue
+            // before an expiry timer gets a turn. Credit each unsent batch once.
+            if let token = press.targetGate, guardedAudioIsFresh?(token) == false {
+                let reason = "target_observation_expired"
+                for remaining in queued[index...] { remaining.discard(remaining.samples.count, reason) }
+                rejectGuarded(token, reason: reason)
+                return false
+            }
             guard press.enqueue(audio.samples, using: audio.enqueue) else {
                 for remaining in queued.suffix(from: index + 1) {
                     remaining.discard(remaining.samples.count, "audio_enqueue_failed")

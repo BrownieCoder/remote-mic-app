@@ -9,6 +9,23 @@ final class DoubaoAdjacentDictation {
         let remote: UInt64
         let output: UInt32
     }
+    /// A positive reader sample and selected input source have independent
+    /// expiry times. Neither clock can renew the other or authorize a new key.
+    struct ReaderPermit {
+        static let maximumAge: UInt64 = 200_000_000
+        let token: UInt64
+        let sourceCheckedAt: UInt64
+        let expires: UInt64
+
+        init(token: UInt64, sampleBeganAt: UInt64, sourceCheckedAt: UInt64) {
+            self.token = token
+            self.sourceCheckedAt = sourceCheckedAt
+            expires = min(sampleBeganAt, sourceCheckedAt) + Self.maximumAge
+        }
+        func allows(_ press: UInt64, at now: UInt64) -> Bool {
+            press == token && now < expires
+        }
+    }
     private struct Receiver {
         let scope: State.Scope
         let target: NSRunningApplication
@@ -31,6 +48,8 @@ final class DoubaoAdjacentDictation {
     private var sampling = false
     private var scheduledTick: DispatchWorkItem?
     private var deadline: DispatchWorkItem?
+    private var permit: ReaderPermit?
+    private var permitExpiry: DispatchWorkItem?
     private var primeUntil: UInt64 = 0
     private var keyHeld = false
     private var unobservedKeyHeld = false
@@ -39,12 +58,17 @@ final class DoubaoAdjacentDictation {
     init(session: RC003HeldFnSession, binding: @escaping () -> Binding?) {
         self.session = session
         self.binding = binding
+        state.onGuardedWindow = { token, observation in
+            AppLogger.shared.write("RC003 HELD FN target_rearm=guarded_window press=\(token) \(observation.rawValue)")
+        }
     }
     func start() {
         guard !enabled else { return }
         enabled = true
+        session.guardedAudioIsFresh = { [weak self] token in self?.permit?.allows(token, at: Self.now) == true }
         session.onGuardedRejection = { [weak self] token, reason in
             guard let self, self.state.contains(token) else { return }
+            if self.permit?.token == token { self.clearPermit() }
             self.perform(self.state.rejectedByQueue(token, reason: reason))
             if self.state.headID == nil { self.prime() }
         }
@@ -70,6 +94,8 @@ final class DoubaoAdjacentDictation {
     }
     func stop(sessionIsCancelling: Bool = false) {
         enabled = false
+        clearPermit()
+        session.guardedAudioIsFresh = nil
         session.onGuardedRejection = nil
         observers.forEach { $0.0.removeObserver($0.1) }
         observers.removeAll()
@@ -149,6 +175,7 @@ final class DoubaoAdjacentDictation {
     func key(_ admission: State.Admission?, down: Bool) {
         guard enabled else { return }
         keyHeld = down
+        if !down, let id = admission?.id, permit?.token == id { clearPermit() }
         if let admission, state.contains(admission.id) {
             state.key(admission.id, down: down, at: Self.now)
             resample()
@@ -220,11 +247,17 @@ final class DoubaoAdjacentDictation {
                 guard valid else { self.environmentChanged("receiver_focus_changed"); return }
                 // A late OS reply cannot authorize an edge or a buffer. Timeout
                 // independently releases a protected press even if a query hangs.
-                if Self.now - begin <= 200_000_000 {
+                if Self.now - begin < ReaderPermit.maximumAge {
                     let seekingWindow = self.state.seekingFirstWindow
-                    self.perform(self.state.observe(observation, epoch: epoch, canOpen: self.session.canOpenGuarded))
+                    let action = self.state.observe(observation, epoch: epoch, canOpen: self.session.canOpenGuarded)
+                    if action == nil, observation.capturing, let token = self.state.confirmedReader {
+                        _ = self.authorizeAudio(token, beganAt: begin, initial: false)
+                    } else {
+                        self.perform(action, sampleBeganAt: begin)
+                    }
                     if seekingWindow, self.state.hasWitnessedCapture {
-                        AppLogger.shared.write("RC003 HELD FN target_rearm=capture_witnessed")
+                        let observed = self.state.sawUnattributedOccupancy ? "occupied_while_held" : "capture_witnessed"
+                        AppLogger.shared.write("RC003 HELD FN target_rearm=\(observed)")
                     }
                     if self.keyHeld && self.state.headID == nil {
                         self.unobservedKeyHeld = true
@@ -237,7 +270,47 @@ final class DoubaoAdjacentDictation {
             }
         }
     }
+    private func clearPermit() {
+        permitExpiry?.cancel()
+        permitExpiry = nil
+        permit = nil
+    }
+
+    private func authorizeAudio(_ token: UInt64, beganAt: UInt64, initial: Bool) -> Bool {
+        let nowBeforeCheck = Self.now
+        if !initial, permit?.allows(token, at: nowBeforeCheck) != true {
+            cancel("target_observation_expired")
+            return false
+        }
+        let sourceCheckedAt: UInt64
+        // During faster panel discovery, reuse a recent source check. Once the
+        // window is known, check on each slower 100 ms reader observation.
+        if !initial, state.demand == .window, let prior = permit?.sourceCheckedAt,
+           nowBeforeCheck - prior < ReaderPermit.maximumAge / 2 {
+            sourceCheckedAt = prior
+        } else {
+            sourceCheckedAt = nowBeforeCheck
+            guard verifyTargetForGrant(token) else { return false }
+        }
+        let receipt = ReaderPermit(token: token, sampleBeganAt: beganAt, sourceCheckedAt: sourceCheckedAt)
+        let now = Self.now
+        guard receipt.allows(token, at: now), initial || permit?.allows(token, at: now) == true else {
+            cancel("target_observation_expired")
+            return false
+        }
+        permit = receipt
+        permitExpiry?.cancel()
+        let job = DispatchWorkItem { [weak self] in
+            guard let self, self.permit?.token == token, self.permit?.allows(token, at: Self.now) == false else { return }
+            self.cancel("target_observation_expired")
+        }
+        permitExpiry = job
+        DispatchQueue.main.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: receipt.expires), execute: job)
+        return true
+    }
+
     private func cancel(_ reason: String) {
+        clearPermit()
         deadline?.cancel()
         scheduledTick?.cancel()
         primeUntil = 0
@@ -245,18 +318,34 @@ final class DoubaoAdjacentDictation {
         unobservedKeyHeld = keyHeld
         if lastStatus == "ready" { status("unavailable") }
     }
-    private func perform(_ action: State.Action?) {
+    // TIS is main-thread-only. Recheck at each guarded privilege boundary,
+    // since a change notification can arrive after the actual input switch.
+    // The immediately preceding background sample verified the AX references.
+    private func verifyTargetForGrant(_ token: UInt64) -> Bool {
+        guard let r = receiver, current(r), state.headID == token, !r.target.isTerminated,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == r.scope.destinationPID,
+              OnboardingInputSourceSwitcher.isSelected(.doubao) else {
+            environmentChanged("target_authorization_changed")
+            return false
+        }
+        return true
+    }
+    private func perform(_ action: State.Action?, sampleBeganAt: UInt64? = nil) {
         switch action {
         case .down(let token):
+            guard let sampleBeganAt, verifyTargetForGrant(token) else { return }
+            guard Self.now - sampleBeganAt < ReaderPermit.maximumAge else { cancel("target_observation_expired"); return }
             if session.openGuarded(token) {
                 AppLogger.shared.write("RC003 HELD FN target_rearm=awaiting_new_reader press=\(token)")
             } else {
                 cancel("target_down_unavailable")
             }
         case .audio(let token):
+            guard let sampleBeganAt, authorizeAudio(token, beganAt: sampleBeganAt, initial: true) else { return }
             AppLogger.shared.write("RC003 HELD FN target_rearm=new_reader_confirmed press=\(token)")
             session.confirmGuardedReader(token)
         case .cancel(let ids, let reason):
+            if let token = permit?.token, ids.contains(token) { clearPermit() }
             // Remove the newest first so a withdrawn predecessor cannot start a
             // descendant mid-cancellation. Counters/discards belong to each press.
             AppLogger.shared.write("RC003 HELD FN target_rearm=discard presses=\(ids.count) reason=\(reason)")
